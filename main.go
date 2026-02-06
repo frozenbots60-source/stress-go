@@ -21,7 +21,7 @@ import (
 // ==========================================
 var (
 	// Fixed: Defaulted to your backend, and ensured logic below converts WSS to HTTPS
-	SERVER_URL             = getEnv("TARGET_URL", "https://code-extract1-840a32439225.herokuapp.com")
+	SERVER_URL             = getEnv("TARGET_URL", "https://code.hh123.site")
 	VERSION                = "6.3.0"
 	LOCALE                 = "en"
 	PLATFORM               = "stake.com"
