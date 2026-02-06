@@ -8,16 +8,16 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
-	"os/signal" // Added
+	"os/signal"
 	"runtime"
 	"strings"
 	"sync"
-	"syscall" // Added
+	"syscall"
 	"time"
 )
 
 // ==========================================
-// CONFIGURATION
+// CONFIGURATION (POWER TUNED)
 // ==========================================
 var (
 	// Fixed: Defaulted to your backend, and ensured logic below converts WSS to HTTPS
@@ -25,30 +25,32 @@ var (
 	VERSION                = "6.3.0"
 	LOCALE                 = "en"
 	PLATFORM               = "stake.com"
-	TOTAL_CLIENTS          = 1000
-	CONCURRENT_CONNECTIONS = 1000
-	RECONNECT_DELAY        = 5 * time.Millisecond
-	HEARTBEAT_INTERVAL     = 5 * time.Millisecond
-	HAMMER_INTERVAL        = 5 * time.Millisecond
-	MAX_RETRY_BACKOFF      = 5 * time.Second
-	BATCH_SIZE             = 2000
-	MAX_WORKERS            = 800
-	REFRESH_INTERVAL       = 20 * time.Millisecond
-	REFRESH_BATCH_SIZE     = 400
+	TOTAL_CLIENTS          = 20000 // Increased from 1000 -> 20,000
+	CONCURRENT_CONNECTIONS = 20000 // Increased from 1000 -> 20,000
+	RECONNECT_DELAY        = 1 * time.Millisecond
+	HEARTBEAT_INTERVAL     = 1 * time.Millisecond // Supersonic Heartbeats
+	HAMMER_INTERVAL        = 1 * time.Millisecond // Supersonic Hammering
+	MAX_RETRY_BACKOFF      = 1 * time.Second
+	BATCH_SIZE             = 5000
+	MAX_WORKERS            = 20000 // Unlimited workers matching clients
+	REFRESH_INTERVAL       = 5 * time.Millisecond
+	REFRESH_BATCH_SIZE     = 1000
 )
 
-// HTTP Client with optimized settings for high concurrency
+// HTTP Client with EXTREME settings for high concurrency
 var httpClient = &http.Client{
-	Timeout: 10 * time.Second,
+	Timeout: 5 * time.Second, // Shorter timeout to fail fast and retry
 	Transport: &http.Transport{
-		MaxIdleConnsPerHost:   1000,
-		MaxIdleConns:          10000,
+		MaxIdleConnsPerHost:   20000, // Massive pool
+		MaxIdleConns:          20000,
 		IdleConnTimeout:       90 * time.Second,
 		DisableCompression:    true,
-		DisableKeepAlives:     false, // Keep-alives are crucial for performance
+		DisableKeepAlives:     false,
 		ForceAttemptHTTP2:     false,
 		MaxConnsPerHost:       0, // Unlimited
-		ResponseHeaderTimeout: 10 * time.Second,
+		ResponseHeaderTimeout: 5 * time.Second,
+		WriteBufferSize:       64 * 1024, // Larger buffers
+		ReadBufferSize:        64 * 1024,
 	},
 }
 
@@ -72,7 +74,7 @@ func generateFakeTurnstileToken() string {
 
 func generateRandomUsername() string {
 	var letters = []rune("abcdefghijklmnopqrstuvwxyz0123456789")
-	b := make([]rune, 10)
+	b := make([]rune, 12) // Slightly longer
 	for i := range b {
 		b[i] = letters[rand.Intn(len(letters))]
 	}
@@ -111,8 +113,8 @@ func NewStressClient(id int) *StressClient {
 		clientID:        id,
 		username:        generateRandomUsername(),
 		authToken:       generateFakeTurnstileToken(),
-		connectionCycle: time.Duration(rand.Intn(60)+30) * time.Second, // 30-90s
-		refreshInterval: REFRESH_INTERVAL + time.Duration(rand.Intn(40)-20)*time.Millisecond,
+		connectionCycle: time.Duration(rand.Intn(30)+10) * time.Second, // Faster recycling
+		refreshInterval: REFRESH_INTERVAL + time.Duration(rand.Intn(10))*time.Millisecond,
 	}
 }
 
@@ -139,7 +141,7 @@ func (c *StressClient) Connect() bool {
 	if err != nil {
 		return false
 	}
-	req.Header.Set("User-Agent", "Go-Stress-Client/1.0")
+	req.Header.Set("User-Agent", "Go-Stress-Client/ULTRA")
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
@@ -152,15 +154,12 @@ func (c *StressClient) Connect() bool {
 	}
 
 	// Read Sid from response body
-	// Response looks like: 0{"sid":"...","upgrades":[],"pingInterval":25000,"pingTimeout":5000}
 	buf := new(bytes.Buffer)
 	buf.ReadFrom(resp.Body)
 	bodyStr := buf.String()
 
 	// Simple parsing to extract SID (robustness can be improved here)
-	// Assuming standard Socket.IO handshake response
 	if strings.Contains(bodyStr, `"sid"`) {
-		// Extract SID between quotes after "sid":
 		parts := strings.Split(bodyStr, `"sid":"`)
 		if len(parts) > 1 {
 			sidPart := strings.Split(parts[1], `"`)[0]
@@ -225,8 +224,6 @@ func (c *StressClient) Disconnect() {
 	if !c.connected {
 		return
 	}
-	// In polling, we just stop sending. The server times out.
-	// Or we could send a disconnect packet: 1
 	c.connected = false
 	c.sid = ""
 }
@@ -239,10 +236,8 @@ func (c *StressClient) SendPing() {
 	}
 	c.lock.Unlock()
 
-	// Socket.IO ping is usually handled at Engine.IO level (2/3 packets),
-	// but the python script sends a custom event 'ping_from_bot'
 	packet, _ := encodePayload("ping_from_bot", map[string]interface{}{
-		"ts": time.Now().Unix(),
+		"ts": time.Now().UnixNano(), // High precision timestamp
 	})
 	c.sendRawPacket(packet)
 
@@ -260,22 +255,22 @@ func (c *StressClient) SendHammer() {
 	}
 	c.lock.Unlock()
 
-	// Create complex payload
+	// Create MASSIVE payload
 	payloadData := make([]map[string]interface{}, 0)
-	numEvents := rand.Intn(10) + 5 // 5 to 15
+	numEvents := rand.Intn(50) + 20 // Increased events per packet (20-70)
 
 	for i := 0; i < numEvents; i++ {
-		// Random string data
-		b := make([]byte, 200)
+		// Larger Random string data
+		b := make([]byte, 1024) // 1KB per event
 		for j := range b {
-			b[j] = byte(rand.Intn(94) + 33) // ASCII printable
+			b[j] = byte(rand.Intn(94) + 33)
 		}
 
 		payloadData = append(payloadData, map[string]interface{}{
-			"type":   "demo_event",
+			"type":   "heavy_event",
 			"client": c.username,
 			"payload": map[string]interface{}{
-				"rand": rand.Intn(10000000),
+				"rand": rand.Intn(999999999),
 				"ts":   float64(time.Now().UnixNano()) / 1e9,
 				"data": string(b),
 			},
@@ -299,9 +294,8 @@ func (c *StressClient) RefreshPage() {
 	}
 	c.lock.Unlock()
 
-	// Simulate page refresh: disconnect and reconnect
 	c.Disconnect()
-	time.Sleep(10 * time.Millisecond) // Short delay
+	// No sleep here for max aggression
 	c.Connect()
 
 	c.lock.Lock()
@@ -334,7 +328,7 @@ func (c *StressClient) Run() {
 
 		if !isConnected {
 			if !c.Connect() {
-				time.Sleep(1 * time.Second)
+				// Retry fast
 				continue
 			}
 		}
@@ -354,8 +348,8 @@ func (c *StressClient) Run() {
 			c.RefreshPage()
 		}
 
-		// Sleep to prevent CPU starvation (1ms matches python)
-		time.Sleep(1 * time.Millisecond)
+		// Removed sleep to burn CPU and max out network
+		// runtime.Gosched() // Yield slightly to allow other goroutines to run
 	}
 }
 
@@ -376,7 +370,7 @@ func main() {
 	}
 
 	log.Println("========================================")
-	log.Println(" STARTING STRESS TEST ")
+	log.Println(" STARTING ULTRA STRESS TEST ")
 	log.Printf(" Target: %s", SERVER_URL)
 	log.Printf(" Clients: %d", TOTAL_CLIENTS)
 	log.Printf(" Workers: %d", MAX_WORKERS)
@@ -392,9 +386,9 @@ func main() {
 			client.Run()
 		}(i)
 
-		// Ramp up
-		if i%100 == 0 {
-			time.Sleep(50 * time.Millisecond)
+		// Faster Ramp up (start 500 at a time)
+		if i%500 == 0 {
+			time.Sleep(10 * time.Millisecond)
 			log.Printf("Started %d/%d clients...", i+1, TOTAL_CLIENTS)
 		}
 	}
