@@ -14,6 +14,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -56,6 +57,13 @@ var httpClient = &http.Client{
 
 // Worker Semaphore to limit max workers
 var workerSemaphore = make(chan struct{}, MAX_WORKERS)
+
+// Global sync variables to print responses exactly ONCE
+var (
+	printLoginOnce     sync.Once
+	printHandshakeOnce sync.Once
+	loggedPoll         int32 // Atomic flag to save RAM on polling
+)
 
 func init() {
 	// Seed the random number generator so usernames are always unique on every run
@@ -165,6 +173,11 @@ func (c *StressClient) Connect() bool {
 		if loginResp, err := httpClient.Do(loginReq); err == nil {
 			bodyBytes, _ := io.ReadAll(loginResp.Body)
 			loginResp.Body.Close()
+			
+			// Print the login response ONE time
+			printLoginOnce.Do(func() {
+				log.Printf("\n[+] FIRST /api/login RESPONSE:\n%s\n", string(bodyBytes))
+			})
 
 			var respData map[string]interface{}
 			if json.Unmarshal(bodyBytes, &respData) == nil {
@@ -205,6 +218,11 @@ func (c *StressClient) Connect() bool {
 	buf.ReadFrom(resp.Body)
 	bodyStr := buf.String()
 	resp.Body.Close()
+	
+	// Print the handshake response ONE time
+	printHandshakeOnce.Do(func() {
+		log.Printf("\n[+] FIRST /socket.io/ HANDSHAKE RESPONSE:\n%s\n", bodyStr)
+	})
 
 	if strings.Contains(bodyStr, `"sid"`) {
 		parts := strings.Split(bodyStr, `"sid":"`)
@@ -287,7 +305,18 @@ func (c *StressClient) Poll() {
 		return
 	}
 	
-	io.Copy(io.Discard, resp.Body)
+	// Atomic check: Only load the body into RAM if we haven't logged it yet.
+	if atomic.LoadInt32(&loggedPoll) == 0 {
+		if atomic.CompareAndSwapInt32(&loggedPoll, 0, 1) {
+			bodyBytes, _ := io.ReadAll(resp.Body)
+			log.Printf("\n[+] FIRST /socket.io/ POLL RESPONSE:\n%s\n", string(bodyBytes))
+		} else {
+			io.Copy(io.Discard, resp.Body)
+		}
+	} else {
+		io.Copy(io.Discard, resp.Body)
+	}
+	
 	resp.Body.Close()
 
 	c.lock.Lock()
