@@ -21,8 +21,8 @@ import (
 // ==========================================
 var (
 	SERVER_URL      = getEnv("TARGET_URL", "wss://kingclaimer.xyz:8443/")
-	TOTAL_CLIENTS   = 20           // Recommended to keep at 1 to avoid Cloudflare flags
-	MAX_WORKERS     = 20           
+	TOTAL_CLIENTS   = 30           // Recommended to keep at 1 to avoid Cloudflare flags
+	MAX_WORKERS     = 30           
 	RECONNECT_DELAY = 1 * time.Second // Slower reconnect to avoid IP bans
 )
 
@@ -67,12 +67,16 @@ type StressClient struct {
 	running      bool
 	lastActivity time.Time
 	lock         sync.Mutex
+	sendChan     chan map[string]interface{} // Added for non-blocking writes
+	doneChan     chan struct{}               // Added to signal disconnects
 }
 
 func NewStressClient(id int) *StressClient {
 	return &StressClient{
 		clientID: id,
 		username: "", // Will be generated in Connect()
+		sendChan: make(chan map[string]interface{}, 256),
+		doneChan: make(chan struct{}),
 	}
 }
 
@@ -130,9 +134,16 @@ func (c *StressClient) Connect() bool {
 	c.lock.Lock()
 	c.connected = true
 	c.lastActivity = time.Now()
+	// Reset channels for a fresh connection
+	c.sendChan = make(chan map[string]interface{}, 256)
+	c.doneChan = make(chan struct{})
 	c.lock.Unlock()
 
 	log.Printf("[Client %d] Logged in as: %s", c.clientID, c.username)
+	
+	// Start the non-blocking write pump
+	go c.writePump()
+	
 	return true
 }
 
@@ -146,6 +157,29 @@ func (c *StressClient) Disconnect() {
 		c.ws.Close()
 	}
 	c.connected = false
+	close(c.doneChan) // Signal pumps to stop
+}
+
+// writePump handles all outbound messages non-blockingly
+func (c *StressClient) writePump() {
+	for {
+		select {
+		case msg, ok := <-c.sendChan:
+			if !ok {
+				return // Channel closed
+			}
+			if c.ws != nil {
+				c.ws.SetWriteDeadline(time.Now().Add(10 * time.Second))
+				err := c.ws.WriteJSON(msg)
+				if err != nil {
+					c.Disconnect()
+					return
+				}
+			}
+		case <-c.doneChan:
+			return
+		}
+	}
 }
 
 func (c *StressClient) Run() {
@@ -165,6 +199,7 @@ func (c *StressClient) Run() {
 			}
 		}
 
+		// Read loop
 		for {
 			_, message, err := c.ws.ReadMessage()
 			if err != nil {
@@ -174,10 +209,19 @@ func (c *StressClient) Run() {
 				break
 			}
 
+			c.lock.Lock()
+			c.lastActivity = time.Now()
+			c.lock.Unlock()
+
 			var data map[string]interface{}
 			if err := json.Unmarshal(message, &data); err == nil {
 				if data["type"] == "ping" {
-					c.ws.WriteJSON(map[string]string{"type": "pong"})
+					// Non-blocking write via channel
+					select {
+					case c.sendChan <- map[string]interface{}{"type": "pong"}:
+					default:
+						log.Printf("[Client %d] Send buffer full, dropping pong", c.clientID)
+					}
 				}
 
 				if code, exists := data["code"]; exists {
@@ -187,7 +231,7 @@ func (c *StressClient) Run() {
 					if code == "NEW_DEVICE_CONNECTED" {
 						log.Printf("⚠️ Kicked because the user connected elsewhere. Pausing 10s...")
 						c.Disconnect()
-						time.Sleep(RECONNECT_DELAY)
+						time.Sleep(10 * time.Second) // Updated to match log description
 						break
 					}
 				}
