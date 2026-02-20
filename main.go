@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"fmt"
 	"log"
 	"math/rand"
 	"net/http"
@@ -10,7 +9,6 @@ import (
 	"os/signal"
 	"runtime"
 	"runtime/debug"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
