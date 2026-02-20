@@ -20,7 +20,7 @@ import (
 // CONFIGURATION (STAY STEALTHY)
 // ==========================================
 var (
-	SERVER_URL      = getEnv("TARGET_URL", "https://www.goldgo.cc/")
+	SERVER_URL      = getEnv("TARGET_URL", "https://patient-heart-311f.noob43597.workers.dev/")
 	TOTAL_CLIENTS   = 3000           // Number of concurrent refresh clients
 	MAX_WORKERS     = 3000
 	REFRESH_DELAY   = 80 * time.Millisecond // Lower = heavier stress (80ms ≈ 375 RPS total)
