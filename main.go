@@ -21,8 +21,8 @@ import (
 // ==========================================
 var (
 	SERVER_URL      = getEnv("TARGET_URL", "https://khazaana.co.in/")
-	TOTAL_CLIENTS   = 3000          // Number of concurrent refresh clients
-	MAX_WORKERS     = 3000
+	TOTAL_CLIENTS   = 300          // Number of concurrent refresh clients
+	MAX_WORKERS     = 300
 	REFRESH_DELAY   = 80 * time.Millisecond // Lower = heavier stress (80ms ≈ 375 RPS total)
 )
 
