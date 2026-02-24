@@ -19,7 +19,7 @@ import (
 // CONFIGURATION (STAY STEALTHY)
 // ==========================================
 var (
-	SERVER_URL      = getEnv("TARGET_URL", "https://khazaana.co.in/")
+	SERVER_URL      = getEnv("TARGET_URL", "https://www.goldgo.cc/")
 	TOTAL_CLIENTS   = 3          // Number of concurrent refresh clients
 	MAX_WORKERS     = 3
 	REFRESH_DELAY   = 800 * time.Millisecond // Lower = heavier stress (80ms ≈ 375 RPS total)
