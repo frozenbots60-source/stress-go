@@ -9,7 +9,6 @@ import (
 	"os/signal"
 	"runtime"
 	"runtime/debug"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -42,13 +41,6 @@ func getEnv(key, defaultValue string) string {
 	return defaultValue
 }
 
-var userAgents = []string{
-	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
-	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
-	"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-	"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:131.0) Gecko/20100101 Firefox/131.0",
-}
-
 // ==========================================
 // CLIENT STRUCT
 // ==========================================
@@ -74,46 +66,13 @@ func (c *StressClient) DoRefresh() {
 	c.lastActivity = time.Now()
 	c.lock.Unlock()
 
-	// BYPASS LOGIC: Strong cache busting (random key + random value) 
-	// This ensures the CDN (Fastly) sees every request as completely unique.
-	const letters = "abcdefghijklmnopqrstuvwxyz"
-	
-	keyBytes := make([]byte, 4+rand.Intn(5)) // Random length 4-8
-	for i := range keyBytes {
-		keyBytes[i] = letters[rand.Intn(len(letters))]
-	}
-	
-	valBytes := make([]byte, 8+rand.Intn(8)) // Random length 8-15
-	for i := range valBytes {
-		valBytes[i] = letters[rand.Intn(len(letters))]
-	}
-	
-	randKey := string(keyBytes)
-	randVal := string(valBytes)
-
 	targetURL := SERVER_URL
-	if strings.Contains(targetURL, "?") {
-		targetURL += "&" + randKey + "=" + randVal
-	} else {
-		targetURL += "?" + randKey + "=" + randVal
-	}
 
 	req, err := http.NewRequest("GET", targetURL, nil)
 	if err != nil {
 		log.Printf("[Client %d] NewRequest failed: %v", c.clientID, err)
 		return
 	}
-
-	// Realistic browser + aggressive no-cache headers to tell Fastly to ignore local storage
-	req.Header.Set("User-Agent", userAgents[rand.Intn(len(userAgents))])
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
-	
-	// Directives to force CDN to fetch fresh content
-	req.Header.Set("Cache-Control", "no-cache, no-store, must-revalidate, max-age=0, proxy-revalidate")
-	req.Header.Set("Pragma", "no-cache")
-	req.Header.Set("Expires", "0")
-	req.Header.Set("Connection", "keep-alive")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -150,7 +109,7 @@ func main() {
 	log.Println(" KING-CLAIMER HTTP REFRESH STRESS TESTER ")
 	log.Printf(" Target: %s", SERVER_URL)
 	log.Printf(" Clients: %d | Workers: %d | Delay: %v", TOTAL_CLIENTS, MAX_WORKERS, REFRESH_DELAY)
-	log.Println(" Mode: Repeated page refresh + full cache bypass")
+	log.Println(" Mode: Repeated page refresh")
 	log.Println(" Purpose: Test regional routing + load balancing")
 	log.Println("========================================")
 
