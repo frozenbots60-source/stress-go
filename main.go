@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"fmt"
 	"log"
 	"math/rand"
 	"net"
@@ -30,6 +29,9 @@ var (
 	RECONNECT_DELAY = 5 * time.Second // Slower reconnect to avoid IP bans
 	serverIP        string
 )
+
+// Worker Semaphore to limit max workers
+var workerSemaphore = make(chan struct{}, MAX_WORKERS)
 
 var (
 	printHandshakeOnce sync.Once
