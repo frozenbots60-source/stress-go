@@ -2,13 +2,17 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"math/rand"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"runtime"
 	"runtime/debug"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -24,10 +28,8 @@ var (
 	TOTAL_CLIENTS   = 20           // Recommended to keep at 1 to avoid Cloudflare flags
 	MAX_WORKERS     = 20           
 	RECONNECT_DELAY = 5 * time.Second // Slower reconnect to avoid IP bans
+	serverIP        string
 )
-
-// Worker Semaphore to limit max workers
-var workerSemaphore = make(chan struct{}, MAX_WORKERS)
 
 var (
 	printHandshakeOnce sync.Once
@@ -91,10 +93,19 @@ func (c *StressClient) Connect() bool {
 	// GENERATE A NEW IDENTITY EVERY TIME IT CONNECTS
 	c.username = generateRandomUsername()
 
+	connectURL := SERVER_URL
+	if serverIP != "" {
+		parsedURL, err := url.Parse(SERVER_URL)
+		if err == nil {
+			parsedURL.Host = serverIP
+			connectURL = parsedURL.String()
+		}
+	}
+
 	dialer := websocket.DefaultDialer
 	dialer.HandshakeTimeout = 10 * time.Second
 
-	ws, resp, err := dialer.Dial(SERVER_URL, getWAFHeaders())
+	ws, resp, err := dialer.Dial(connectURL, getWAFHeaders())
 	if err != nil {
 		if resp != nil {
 			log.Printf("[Client %d] Dial failed with status: %d", c.clientID, resp.StatusCode)
@@ -102,14 +113,19 @@ func (c *StressClient) Connect() bool {
 		return false
 	}
 
-	c.ws = ws
-
 	// Wait for "WELCOME"
 	ws.SetReadDeadline(time.Now().Add(10 * time.Second))
 	_, welcomeMsg, err := ws.ReadMessage()
 	if err != nil {
 		c.Disconnect()
 		return false
+	}
+
+	if serverIP == "" {
+		if tcpAddr, ok := ws.RemoteAddr().(*net.TCPAddr); ok {
+			serverIP = tcpAddr.IP.String() + ":" + strconv.Itoa(tcpAddr.Port)
+			log.Printf("[Client %d] Resolved server IP: %s", c.clientID, serverIP)
+		}
 	}
 
 	printHandshakeOnce.Do(func() {
