@@ -22,7 +22,7 @@ var (
 	BASE_URL      = "https://shrutibots.site/stream/"
 	TOTAL_CLIENTS = 1
 	MAX_WORKERS   = 1
-	REFRESH_DELAY = 10000 * time.Millisecond // 10 seconds (0.1 RPS)
+	REFRESH_DELAY = 1000 * time.Millisecond // 10 seconds (0.1 RPS)
 )
 
 var workerSemaphore = make(chan struct{}, MAX_WORKERS)
