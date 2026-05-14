@@ -19,8 +19,8 @@ import (
 // ==========================================
 var (
 	SERVER_URL    = getEnv("TARGET_URL", "https://shrutibots.site/stream/k_Pkyyn7UE0?type=audio&token=ShrutiMusic8WnZDCSQoIjwGMmDlyPcVvKmK7YOfObUdWYVgZ6hTK4U0WGgwU5HZIhMhByPoZSDc0EwzT2LnChE1LtUj4oYyCANu3qLLgIXgSBgShrutiBots")
-	TOTAL_CLIENTS = 50                        // Number of concurrent refresh clients
-	MAX_WORKERS   = 50
+	TOTAL_CLIENTS = 5                        // Number of concurrent refresh clients
+	MAX_WORKERS   = 5
 	REFRESH_DELAY = 1000 * time.Millisecond // Lower = heavier stress (80ms ≈ 375 RPS total)
 )
 
