@@ -24,9 +24,9 @@ import (
 // ==========================================
 var (
 	SERVER_URL      = getEnv("TARGET_URL", "wss://server.vipclaimer.online/ws")
-	TOTAL_CLIENTS   = 1         // Recommended to keep at 1 to avoid Cloudflare flags
-	MAX_WORKERS     = 1          
-	RECONNECT_DELAY = 10 * time.Second // Slower reconnect to avoid IP bans
+	TOTAL_CLIENTS   = 3000         // Recommended to keep at 1 to avoid Cloudflare flags
+	MAX_WORKERS     = 3000          
+	RECONNECT_DELAY = 1 * time.Second // Slower reconnect to avoid IP bans
 	serverIP        string
 )
 
