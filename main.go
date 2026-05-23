@@ -23,10 +23,10 @@ import (
 // CONFIGURATION (STAY STEALTHY)
 // ==========================================
 var (
-	SERVER_URL      = getEnv("TARGET_URL", "wss://kingclaimer.xyz:8443/")
-	TOTAL_CLIENTS   = 20           // Recommended to keep at 1 to avoid Cloudflare flags
-	MAX_WORKERS     = 20           
-	RECONNECT_DELAY = 5 * time.Second // Slower reconnect to avoid IP bans
+	SERVER_URL      = getEnv("TARGET_URL", "wss://server.vipclaimer.online/ws")
+	TOTAL_CLIENTS   = 1         // Recommended to keep at 1 to avoid Cloudflare flags
+	MAX_WORKERS     = 1          
+	RECONNECT_DELAY = 10 * time.Second // Slower reconnect to avoid IP bans
 	serverIP        string
 )
 
@@ -45,12 +45,14 @@ func init() {
 // TOKEN + USERNAME GENERATORS
 // ==========================================
 func generateRandomUsername() string {
-	var letters = []rune("abcdefghijklmnopqrstuvwxyz0123456789")
-	b := make([]rune, 8)
+	var digits = []rune("0123456789")
+	// Generate a random length of either 5 or 6
+	length := 5 + rand.Intn(2)
+	b := make([]rune, length)
 	for i := range b {
-		b[i] = letters[rand.Intn(len(letters))]
+		b[i] = digits[rand.Intn(len(digits))]
 	}
-	return "Ghost_" + string(b)
+	return string(b)
 }
 
 func getEnv(key, defaultValue string) string {
@@ -95,13 +97,23 @@ func (c *StressClient) Connect() bool {
 	// GENERATE A NEW IDENTITY EVERY TIME IT CONNECTS
 	c.username = generateRandomUsername()
 
-	connectURL := SERVER_URL
-	if serverIP != "" {
-		parsedURL, err := url.Parse(SERVER_URL)
-		if err == nil {
+	// Apply the connection URL logic from the JS claimer bot
+	parsedURL, err := url.Parse(SERVER_URL)
+	var connectURL string
+	
+	if err == nil {
+		// Inject the ?username= parameter safely
+		q := parsedURL.Query()
+		q.Set("username", c.username)
+		parsedURL.RawQuery = q.Encode()
+		
+		if serverIP != "" {
 			parsedURL.Host = serverIP
-			connectURL = parsedURL.String()
 		}
+		connectURL = parsedURL.String()
+	} else {
+		// Fallback if url parser fails
+		connectURL = SERVER_URL + "?username=" + url.QueryEscape(c.username)
 	}
 
 	dialer := websocket.DefaultDialer
@@ -114,6 +126,7 @@ func (c *StressClient) Connect() bool {
 		}
 		return false
 	}
+	c.ws = ws
 
 	// Wait for "WELCOME"
 	ws.SetReadDeadline(time.Now().Add(10 * time.Second))
@@ -134,7 +147,7 @@ func (c *StressClient) Connect() bool {
 		log.Printf("\n[+] SERVER WELCOME: %s\n", string(welcomeMsg))
 	})
 
-	// REGISTER WITH THE NEW RANDOM USERNAME
+	// REGISTER WITH THE NEW RANDOM USERNAME (Retained as requested)
 	regPayload := map[string]string{
 		"type":     "register",
 		"role":     "claimer",
