@@ -141,7 +141,7 @@ func getWAFHeaders() http.Header {
 func (c *StressClient) Connect() bool {
 	c.username = generateRandomUsername()
 
-	// Generate HMAC Token (Core Logic Added)
+	// Generate HMAC Token (Kept for compatibility)
 	authToken, err := generateHMACAuthToken(c.username)
 	if err != nil {
 		log.Printf("[Client %d] Failed to generate auth token", c.clientID)
@@ -154,7 +154,7 @@ func (c *StressClient) Connect() bool {
 	if err == nil {
 		q := parsedURL.Query()
 		q.Set("username", c.username)
-		q.Set("nonce", authToken) // Important: Sending HMAC token
+		q.Set("nonce", authToken)
 		parsedURL.RawQuery = q.Encode()
 
 		if serverIP != "" {
@@ -197,12 +197,12 @@ func (c *StressClient) Connect() bool {
 		log.Printf("\n[+] SERVER WELCOME: %s\n", string(welcomeMsg))
 	})
 
-	// Register
+	// Register - Simplified to match new server log (only username)
 	regPayload := map[string]interface{}{
 		"type":     "register",
 		"role":     "claimer",
 		"username": c.username,
-		"token":    authToken, // Sending HMAC token
+		// "token": authToken,  // Commented out - new server rejects complex auth
 	}
 
 	err = ws.WriteJSON(regPayload)
@@ -220,7 +220,7 @@ func (c *StressClient) Connect() bool {
 	c.doneChan = make(chan struct{})
 	c.lock.Unlock()
 
-	log.Printf("[Client %d] Logged in as: %s | Token: %s...", c.clientID, c.username, authToken[:30]+"...")
+	log.Printf("[Client %d] Logged in as: %s", c.clientID, c.username)
 
 	go c.writePump()
 	return true
@@ -307,8 +307,8 @@ func (c *StressClient) Run() {
 					}
 				}
 
-				if data["message"] == "Authentication failed" {
-					log.Printf("🛑 BANNED/INVALID. Reconnecting...")
+				if data["message"] == "Authentication failed" || data["code"] == "INVALID_USERNAME" {
+					log.Printf("🛑 AUTH FAILED (INVALID_USERNAME). Reconnecting with new username...")
 					c.Disconnect()
 					time.Sleep(RECONNECT_DELAY)
 					break
