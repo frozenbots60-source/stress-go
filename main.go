@@ -31,7 +31,7 @@ var (
 	SERVER_URL     = getEnv("TARGET_URL", "wss://api.vipclaimer.online/ws")
 	TOTAL_CLIENTS  = 3000
 	MAX_WORKERS    = 3000
-	RECONNECT_DELAY = 0.1 * time.Second
+	RECONNECT_DELAY = 1 * time.Second
 	serverIP       string
 )
 
