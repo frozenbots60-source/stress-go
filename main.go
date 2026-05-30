@@ -29,8 +29,8 @@ import (
 // ==========================================
 var (
 	SERVER_URL     = getEnv("TARGET_URL", "wss://kingclaimer.xyz:8443/")
-	TOTAL_CLIENTS  = 3
-	MAX_WORKERS    = 3
+	TOTAL_CLIENTS  = 8
+	MAX_WORKERS    = 8
 	RECONNECT_DELAY = 3 * time.Second
 	serverIP       string
 )
