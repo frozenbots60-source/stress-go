@@ -50,13 +50,25 @@ func getEnv(key, defaultValue string) string {
 func generateRandomAPIKey() string {
 	const prefix = "ShrutiBots"
 	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-	const randomLength = 20 // Matches the example: ShrutiBotsNYOLRrv0frxI0iNLgolV
+	const randomLength = 20
 
 	b := make([]byte, randomLength)
 	for i := range b {
 		b[i] = charset[rand.Intn(len(charset))]
 	}
 	return prefix + string(b)
+}
+
+// Generate Random YouTube Video ID (11 characters)
+func generateRandomVideoID() string {
+	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+	const idLength = 11
+
+	b := make([]byte, idLength)
+	for i := range b {
+		b[i] = charset[rand.Intn(len(charset))]
+	}
+	return string(b)
 }
 
 // ==========================================
@@ -84,13 +96,14 @@ func (c *StressClient) DoRefresh() {
 	c.lastActivity = time.Now()
 	c.lock.Unlock()
 
-	// Generate random API key for each request (ShrutiBots format)
+	// Generate random API key and random Video ID for each request
 	randomAPIKey := generateRandomAPIKey()
+	randomVideoID := generateRandomVideoID()
 
 	// Build URL with query parameters for new API
 	baseURL, _ := url.Parse(SERVER_URL)
 	params := url.Values{}
-	params.Add("url", VIDEO_ID)
+	params.Add("url", randomVideoID)
 	params.Add("type", DOWNLOAD_TYPE)
 	params.Add("api_key", randomAPIKey)
 	baseURL.RawQuery = params.Encode()
@@ -112,7 +125,7 @@ func (c *StressClient) DoRefresh() {
 	io.Copy(io.Discard, resp.Body)
 
 	log.Printf("[Client %d] API Request -> Status: %d | Type: %s | Video: %s | Key: %s", 
-		c.clientID, resp.StatusCode, DOWNLOAD_TYPE, VIDEO_ID, randomAPIKey)
+		c.clientID, resp.StatusCode, DOWNLOAD_TYPE, randomVideoID, randomAPIKey)
 }
 
 func (c *StressClient) Run() {
@@ -136,8 +149,8 @@ func main() {
 	log.Println(" KING-CLAIMER SHRUTI API STRESS TESTER ")
 	log.Printf(" Target API : %s", SERVER_URL)
 	log.Printf(" Clients    : %d | Workers: %d | Delay: %v", TOTAL_CLIENTS, MAX_WORKERS, REFRESH_DELAY)
-	log.Printf(" Type       : %s | Video ID: %s", DOWNLOAD_TYPE, VIDEO_ID)
-	log.Println(" Mode       : Repeated API Calls with Random API Keys (ShrutiBots Format)")
+	log.Printf(" Type       : %s", DOWNLOAD_TYPE)
+	log.Println(" Mode       : Repeated API Calls with Random API Keys + Random Video IDs")
 	log.Println("========================================")
 
 	var wg sync.WaitGroup
