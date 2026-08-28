@@ -1,22 +1,23 @@
 package main
 
 import (
-	"crypto/hmac"
+	"bytes"
+	cryptorand "crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
-	"encoding/hex"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
-	"math/rand"
-	"net"
+	mathrand "math/rand"
 	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
 	"runtime"
 	"runtime/debug"
-	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -25,206 +26,236 @@ import (
 )
 
 // ==========================================
-// CONFIGURATION (STAY STEALTHY)
+// CONFIGURATION
 // ==========================================
 var (
-	SERVER_URL      = getEnv("TARGET_URL", "wss://ws.mvpsensi.in/ws/codes") // ← changed
+	API_BASE_URL    = getEnv("TARGET_URL", "https://kciade.online")
+	RECONNECT_DELAY = 10 * time.Second
 	TOTAL_CLIENTS   = 1
 	MAX_WORKERS     = 1
-	RECONNECT_DELAY = 10 * time.Second
-	serverIP        string
 )
 
-// Shared Secret from JS Claimer
-const SHARED_SECRET = "vipxK9mP2vL8nQ4wRjT5bYc"
-
 var workerSemaphore = make(chan struct{}, MAX_WORKERS)
-var printHandshakeOnce sync.Once
 
 func init() {
-	rand.Seed(time.Now().UnixNano())
-}
-
-// ==========================================
-// TOKEN + USERNAME GENERATORS
-// ==========================================
-func generateRandomUsername() string {
-	var digits = []rune("0123456789")
-	length := 5 + rand.Intn(2)
-	b := make([]rune, length)
-	for i := range b {
-		b[i] = digits[rand.Intn(len(digits))]
-	}
-	return string(b)
+	mathrand.Seed(time.Now().UnixNano())
 }
 
 func getEnv(key, defaultValue string) string {
-	if value, exists := os.LookupEnv(key); exists {
-		return value
+	if v, ok := os.LookupEnv(key); ok {
+		return v
 	}
 	return defaultValue
 }
 
+func randomUsername() string {
+	chars := []rune("abcdefghijklmnopqrstuvwxyz0123456789")
+	b := make([]rune, 10)
+	for i := range b {
+		b[i] = chars[mathrand.Intn(len(chars))]
+	}
+	return string(b)
+}
+
+// generateLicenseKey builds a random key matching format:
+// THECLAIMERS-xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx
+func generateLicenseKey() string {
+	var buf [16]byte
+	cryptorand.Read(buf[:])
+	// set UUID v4 version and variant bits
+	buf[6] = (buf[6] & 0x0f) | 0x40
+	buf[8] = (buf[8] & 0x3f) | 0x80
+	return fmt.Sprintf("THECLAIMERS-%08x-%04x-%04x-%04x-%012x",
+		buf[0:4], buf[4:6], buf[6:8], buf[8:10], buf[10:16])
+}
+
 // ==========================================
-// HMAC TOKEN GENERATION (Exact JS Logic Ported)
+// RSA KEY PAIR (for Socket.IO session_key)
 // ==========================================
-func getServerTime() (int64, error) {
-	resp, err := http.Get("https://api.vipclaimer.online/api/server-time")
+type RSAKeys struct {
+	privKey *rsa.PrivateKey
+	pubPEM  string
+}
+
+func generateRSAKeys() (*RSAKeys, error) {
+	priv, err := rsa.GenerateKey(cryptorand.Reader, 2048)
 	if err != nil {
-		return 0, err
+		return nil, err
+	}
+	pubBytes, err := x509.MarshalPKIXPublicKey(&priv.PublicKey)
+	if err != nil {
+		return nil, err
+	}
+	b64 := base64.StdEncoding.EncodeToString(pubBytes)
+	var lines []string
+	for len(b64) > 64 {
+		lines = append(lines, b64[:64])
+		b64 = b64[64:]
+	}
+	if len(b64) > 0 {
+		lines = append(lines, b64)
+	}
+	pubPEM := "-----BEGIN PUBLIC KEY-----\n" + strings.Join(lines, "\n") + "\n-----END PUBLIC KEY-----"
+	return &RSAKeys{privKey: priv, pubPEM: pubPEM}, nil
+}
+
+func (k *RSAKeys) DecryptOAEP(cipherB64 string) ([]byte, error) {
+	cipher, err := base64.StdEncoding.DecodeString(cipherB64)
+	if err != nil {
+		return nil, err
+	}
+	return rsa.DecryptOAEP(sha256.New(), cryptorand.Reader, k.privKey, cipher, nil)
+}
+
+// ==========================================
+// LICENSE TOKEN
+// ==========================================
+func fetchLicenseToken(licenseKey string) (string, error) {
+	body, _ := json.Marshal(map[string]string{"license_key": licenseKey})
+	resp, err := http.Post(API_BASE_URL+"/api/license/token", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return "", fmt.Errorf("HTTP error: %w", err)
 	}
 	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return 0, err
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("license/token returned HTTP %d", resp.StatusCode)
 	}
-
 	var data map[string]interface{}
-	if err := json.Unmarshal(body, &data); err != nil {
-		return 0, err
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return "", err
 	}
-
-	if t, ok := data["t"].(float64); ok {
-		return int64(t), nil
+	token, ok := data["token"].(string)
+	if !ok || token == "" {
+		return "", fmt.Errorf("no token field in license response")
 	}
-	return time.Now().Unix(), nil
-}
-
-func generateHMACAuthToken(username string) (string, error) {
-	serverTime, err := getServerTime()
-	if err != nil {
-		log.Printf("[WARN] Server time fetch failed, using local time")
-		serverTime = time.Now().Unix()
-	}
-
-	message := fmt.Sprintf("%s:%d", username, serverTime)
-	key := []byte(SHARED_SECRET)
-
-	h := hmac.New(sha256.New, key)
-	h.Write([]byte(message))
-	signature := hex.EncodeToString(h.Sum(nil))
-
-	return fmt.Sprintf("%d:%s", serverTime, signature), nil
+	return token, nil
 }
 
 // ==========================================
-// CLIENT STRUCT
+// SOCKET.IO EVENT PARSER
 // ==========================================
-type StressClient struct {
-	clientID     int
-	username     string
-	ws           *websocket.Conn
-	connected    bool
-	running      bool
-	lastActivity time.Time
-	lock         sync.Mutex
-	sendChan     chan map[string]interface{}
-	doneChan     chan struct{}
+// Socket.IO over EIO=4: events are "42[\"name\",data]"
+func parseSIOEvent(raw []byte) (string, json.RawMessage) {
+	s := string(raw)
+	if !strings.HasPrefix(s, "42") {
+		return "", nil
+	}
+	var arr []json.RawMessage
+	if err := json.Unmarshal([]byte(s[2:]), &arr); err != nil || len(arr) < 2 {
+		return "", nil
+	}
+	var name string
+	if err := json.Unmarshal(arr[0], &name); err != nil {
+		return "", nil
+	}
+	return name, arr[1]
 }
 
-func NewStressClient(id int) *StressClient {
-	return &StressClient{
+// ==========================================
+// CLIENT
+// ==========================================
+type KciadeClient struct {
+	clientID  int
+	username  string
+	ws        *websocket.Conn
+	connected bool
+	running   bool
+	rsaKeys   *RSAKeys
+	lock      sync.Mutex
+	doneChan  chan struct{}
+}
+
+func NewKciadeClient(id int) *KciadeClient {
+	return &KciadeClient{
 		clientID: id,
-		sendChan: make(chan map[string]interface{}, 256),
 		doneChan: make(chan struct{}),
 	}
 }
 
-func getWAFHeaders() http.Header {
-	headers := http.Header{}
-	headers.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-	headers.Add("Origin", "https://stake.com")
-	return headers
+func getHeaders() http.Header {
+	h := http.Header{}
+	h.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	h.Set("Origin", "https://stake.com")
+	return h
 }
 
-func (c *StressClient) Connect() bool {
-	c.username = generateRandomUsername()
-
-	// Generate HMAC Token (Core Logic Added)
-	authToken, err := generateHMACAuthToken(c.username)
+func (c *KciadeClient) Connect(licenseToken string) bool {
+	keys, err := generateRSAKeys()
 	if err != nil {
-		log.Printf("[Client %d] Failed to generate auth token", c.clientID)
+		log.Printf("[Client %d] RSA keygen failed: %v", c.clientID, err)
 		return false
 	}
+	c.rsaKeys = keys
 
-	parsedURL, err := url.Parse(SERVER_URL)
-	var connectURL string
+	wsBase := strings.Replace(API_BASE_URL, "https://", "wss://", 1)
+	wsBase = strings.Replace(wsBase, "http://", "ws://", 1)
 
-	if err == nil {
-		q := parsedURL.Query()
-		q.Set("user", c.username) // ← changed: Surya uses ?user= not ?username=
-		// nonce/HMAC not used by Surya — omitted
-		parsedURL.RawQuery = q.Encode()
-
-		if serverIP != "" {
-			parsedURL.Host = serverIP
-		}
-		connectURL = parsedURL.String()
-	} else {
-		connectURL = SERVER_URL + "?user=" + url.QueryEscape(c.username) // ← changed
+	u, err := url.Parse(wsBase + "/_tmc/")
+	if err != nil {
+		log.Printf("[Client %d] URL parse failed: %v", c.clientID, err)
+		return false
 	}
+	q := u.Query()
+	q.Set("EIO", "4")
+	q.Set("transport", "websocket")
+	q.Set("user", c.username)
+	q.Set("token", licenseToken)
+	q.Set("rsa_pub", keys.pubPEM)
+	u.RawQuery = q.Encode()
 
 	dialer := websocket.DefaultDialer
-	dialer.HandshakeTimeout = 10 * time.Second
+	dialer.HandshakeTimeout = 15 * time.Second
 
-	ws, resp, err := dialer.Dial(connectURL, getWAFHeaders())
+	ws, resp, err := dialer.Dial(u.String(), getHeaders())
 	if err != nil {
 		if resp != nil {
-			log.Printf("[Client %d] Dial failed with status: %d", c.clientID, resp.StatusCode)
+			log.Printf("[Client %d] Dial failed HTTP %d", c.clientID, resp.StatusCode)
+		} else {
+			log.Printf("[Client %d] Dial failed: %v", c.clientID, err)
 		}
 		return false
 	}
-
 	c.ws = ws
 
-	// Wait for WELCOME
+	// Read EIO OPEN "0{...}"
 	ws.SetReadDeadline(time.Now().Add(10 * time.Second))
-	_, welcomeMsg, err := ws.ReadMessage()
-	if err != nil {
-		c.Disconnect()
-		return false
-	}
-
-	if serverIP == "" {
-		if tcpAddr, ok := ws.RemoteAddr().(*net.TCPAddr); ok {
-			serverIP = tcpAddr.IP.String() + ":" + strconv.Itoa(tcpAddr.Port)
-			log.Printf("[Client %d] Resolved server IP: %s", c.clientID, serverIP)
-		}
-	}
-
-	printHandshakeOnce.Do(func() {
-		log.Printf("\n[+] SERVER WELCOME: %s\n", string(welcomeMsg))
-	})
-
-	// Auth — Surya uses {"type":"auth","user":USERNAME} not "register" ← changed
-	regPayload := map[string]interface{}{
-		"type": "auth",
-		"user": c.username,
-	}
-
-	err = ws.WriteJSON(regPayload)
-	if err != nil {
-		c.Disconnect()
-		return false
-	}
-
+	_, openMsg, err := ws.ReadMessage()
 	ws.SetReadDeadline(time.Time{})
+	if err != nil {
+		log.Printf("[Client %d] No EIO OPEN: %v", c.clientID, err)
+		ws.Close()
+		return false
+	}
+	log.Printf("[Client %d] 📡 EIO OPEN: %s", c.clientID, string(openMsg))
+
+	// Send Socket.IO CONNECT "40"
+	if err := ws.WriteMessage(websocket.TextMessage, []byte("40")); err != nil {
+		log.Printf("[Client %d] SIO CONNECT send failed: %v", c.clientID, err)
+		ws.Close()
+		return false
+	}
+
+	// Read Socket.IO connected "40{...}"
+	ws.SetReadDeadline(time.Now().Add(10 * time.Second))
+	_, connMsg, err := ws.ReadMessage()
+	ws.SetReadDeadline(time.Time{})
+	if err != nil {
+		log.Printf("[Client %d] No SIO CONNECTED: %v", c.clientID, err)
+		ws.Close()
+		return false
+	}
+	log.Printf("[Client %d] 🔗 SIO CONNECTED: %s", c.clientID, string(connMsg))
 
 	c.lock.Lock()
 	c.connected = true
-	c.lastActivity = time.Now()
-	c.sendChan = make(chan map[string]interface{}, 256)
 	c.doneChan = make(chan struct{})
 	c.lock.Unlock()
 
-	log.Printf("[Client %d] Auth sent for user: %s | HMAC: %s...", c.clientID, c.username, authToken[:30]+"...")
-
-	go c.writePump()
+	log.Printf("[Client %d] ✅ Connected as user=%s", c.clientID, c.username)
 	return true
 }
 
-func (c *StressClient) Disconnect() {
+func (c *KciadeClient) Disconnect() {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 	if !c.connected {
@@ -237,86 +268,96 @@ func (c *StressClient) Disconnect() {
 	close(c.doneChan)
 }
 
-func (c *StressClient) writePump() {
-	for {
-		select {
-		case msg, ok := <-c.sendChan:
-			if !ok {
-				return
-			}
-			if c.ws != nil {
-				c.ws.SetWriteDeadline(time.Now().Add(10 * time.Second))
-				if err := c.ws.WriteJSON(msg); err != nil {
-					c.Disconnect()
-					return
-				}
-			}
-		case <-c.doneChan:
-			return
-		}
-	}
-}
-
-func (c *StressClient) Run() {
+func (c *KciadeClient) Run() {
 	c.running = true
 	workerSemaphore <- struct{}{}
 	defer func() { <-workerSemaphore }()
 
 	for c.running {
-		c.lock.Lock()
-		isConnected := c.connected
-		c.lock.Unlock()
+		c.username = randomUsername()
+		licenseKey := generateLicenseKey()
+		log.Printf("[Client %d] Trying user=%s key=%s", c.clientID, c.username, licenseKey)
 
-		if !isConnected {
-			if !c.Connect() {
-				time.Sleep(RECONNECT_DELAY)
-				continue
-			}
+		log.Printf("[Client %d] Fetching license token...", c.clientID)
+		licenseToken, err := fetchLicenseToken(licenseKey)
+		if err != nil {
+			log.Printf("[Client %d] ❌ License token error: %v — retrying in %s", c.clientID, err, RECONNECT_DELAY)
+			time.Sleep(RECONNECT_DELAY)
+			continue
+		}
+		log.Printf("[Client %d] 🎫 License token OK (len=%d)", c.clientID, len(licenseToken))
+
+		if !c.Connect(licenseToken) {
+			time.Sleep(RECONNECT_DELAY)
+			continue
 		}
 
 		for {
-			_, message, err := c.ws.ReadMessage()
+			_, raw, err := c.ws.ReadMessage()
 			if err != nil {
+				log.Printf("[Client %d] Connection lost: %v", c.clientID, err)
 				c.Disconnect()
 				time.Sleep(RECONNECT_DELAY)
 				break
 			}
 
-			c.lock.Lock()
-			c.lastActivity = time.Now()
-			c.lock.Unlock()
+			msg := string(raw)
 
-			var data map[string]interface{}
-			if err := json.Unmarshal(message, &data); err == nil {
-				if data["type"] == "ping" {
-					select {
-					case c.sendChan <- map[string]interface{}{"type": "pong"}:
-					default:
-					}
-				}
-
-				if code, exists := data["code"]; exists {
-					log.Printf("\n🔥 [LEAKED]: %v 🔥\n", code)
-					if code == "NEW_DEVICE_CONNECTED" {
-						log.Printf("⚠️ Kicked because the user connected elsewhere. Pausing 10s...")
-						c.Disconnect()
-						time.Sleep(10 * time.Second)
-						break
-					}
-				}
-
-				if data["message"] == "Authentication failed" {
-					log.Printf("🛑 BANNED/INVALID. Reconnecting...")
-					c.Disconnect()
-					time.Sleep(RECONNECT_DELAY)
-					break
-				}
+			// EIO PING → reply PONG
+			if msg == "2" {
+				c.ws.WriteMessage(websocket.TextMessage, []byte("3"))
+				continue
 			}
-			runtime.Gosched()
+
+			// EIO CLOSE
+			if msg == "1" {
+				log.Printf("[Client %d] Server closed connection", c.clientID)
+				c.Disconnect()
+				time.Sleep(RECONNECT_DELAY)
+				break
+			}
+
+			// Socket.IO event "42[...]"
+			if strings.HasPrefix(msg, "42") {
+				eventName, dataRaw := parseSIOEvent(raw)
+				log.Printf("[Client %d] 📨 EVENT=%s DATA=%s", c.clientID, eventName, string(dataRaw))
+
+				switch eventName {
+				case "session_key":
+					var skMsg map[string]string
+					if err := json.Unmarshal(dataRaw, &skMsg); err == nil {
+						if encKey, ok := skMsg["key"]; ok && c.rsaKeys != nil {
+							aesKey, err := c.rsaKeys.DecryptOAEP(encKey)
+							if err != nil {
+								log.Printf("[Client %d] ❌ RSA decrypt failed: %v", c.clientID, err)
+							} else {
+								log.Printf("[Client %d] 🔑 AES session key ready (%d bytes)", c.clientID, len(aesKey))
+							}
+						}
+					}
+
+				case "pong":
+					// server-level pong, nothing to do
+
+				default:
+					var dataMap map[string]interface{}
+					if err := json.Unmarshal(dataRaw, &dataMap); err == nil {
+						if code, ok := dataMap["code"].(string); ok && code != "" {
+							log.Printf("\n🔥 [CODE]: %s 🔥\n", code)
+						}
+					}
+				}
+				continue
+			}
+
+			log.Printf("[Client %d] 📩 RAW: %s", c.clientID, msg)
 		}
 	}
 }
 
+// ==========================================
+// MAIN
+// ==========================================
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmsgprefix)
 	debug.SetMemoryLimit(850 * 1024 * 1024)
@@ -324,8 +365,8 @@ func main() {
 
 	log.Println("========================================")
 	log.Println(" KING-CLAIMER STEALTH GHOST ACTIVE ")
-	log.Printf(" Target: %s", SERVER_URL)
-	log.Println(" HMAC Auth + Random Username Active ")
+	log.Printf(" Target: %s/_tmc", API_BASE_URL)
+	log.Println(" Random Keys + Random Usernames Active ")
 	log.Println("========================================")
 
 	var wg sync.WaitGroup
@@ -333,7 +374,7 @@ func main() {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			client := NewStressClient(id)
+			client := NewKciadeClient(id)
 			client.Run()
 		}(i)
 	}
@@ -343,5 +384,4 @@ func main() {
 	<-done
 
 	log.Println("Shutting down...")
-	wg.Wait()
 }
