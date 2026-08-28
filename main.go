@@ -30,9 +30,9 @@ import (
 // ==========================================
 var (
 	API_BASE_URL    = getEnv("TARGET_URL", "https://kciade.online")
-	RECONNECT_DELAY = 10 * time.Second
-	TOTAL_CLIENTS   = 1
-	MAX_WORKERS     = 1
+	RECONNECT_DELAY = 0.5 * time.Second
+	TOTAL_CLIENTS   = 200
+	MAX_WORKERS     = 20
 )
 
 var workerSemaphore = make(chan struct{}, MAX_WORKERS)
