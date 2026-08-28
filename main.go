@@ -28,11 +28,11 @@ import (
 // CONFIGURATION (STAY STEALTHY)
 // ==========================================
 var (
-	SERVER_URL     = getEnv("TARGET_URL", "wss://api.vipclaimer.online/ws")
-	TOTAL_CLIENTS  = 3000
-	MAX_WORKERS    = 3000
-	RECONNECT_DELAY = 1 * time.Second
-	serverIP       string
+	SERVER_URL      = getEnv("TARGET_URL", "wss://ws.mvpsensi.in/ws/codes") // ← changed
+	TOTAL_CLIENTS   = 1
+	MAX_WORKERS     = 1
+	RECONNECT_DELAY = 10 * time.Second
+	serverIP        string
 )
 
 // Shared Secret from JS Claimer
@@ -153,8 +153,8 @@ func (c *StressClient) Connect() bool {
 
 	if err == nil {
 		q := parsedURL.Query()
-		q.Set("username", c.username)
-		q.Set("nonce", authToken) // Important: Sending HMAC token
+		q.Set("user", c.username) // ← changed: Surya uses ?user= not ?username=
+		// nonce/HMAC not used by Surya — omitted
 		parsedURL.RawQuery = q.Encode()
 
 		if serverIP != "" {
@@ -162,7 +162,7 @@ func (c *StressClient) Connect() bool {
 		}
 		connectURL = parsedURL.String()
 	} else {
-		connectURL = SERVER_URL + "?username=" + url.QueryEscape(c.username) + "&nonce=" + url.QueryEscape(authToken)
+		connectURL = SERVER_URL + "?user=" + url.QueryEscape(c.username) // ← changed
 	}
 
 	dialer := websocket.DefaultDialer
@@ -197,12 +197,10 @@ func (c *StressClient) Connect() bool {
 		log.Printf("\n[+] SERVER WELCOME: %s\n", string(welcomeMsg))
 	})
 
-	// Register
+	// Auth — Surya uses {"type":"auth","user":USERNAME} not "register" ← changed
 	regPayload := map[string]interface{}{
-		"type":     "register",
-		"role":     "claimer",
-		"username": c.username,
-		"token":    authToken, // Sending HMAC token
+		"type": "auth",
+		"user": c.username,
 	}
 
 	err = ws.WriteJSON(regPayload)
@@ -220,7 +218,7 @@ func (c *StressClient) Connect() bool {
 	c.doneChan = make(chan struct{})
 	c.lock.Unlock()
 
-	log.Printf("[Client %d] Logged in as: %s | Token: %s...", c.clientID, c.username, authToken[:30]+"...")
+	log.Printf("[Client %d] Auth sent for user: %s | HMAC: %s...", c.clientID, c.username, authToken[:30]+"...")
 
 	go c.writePump()
 	return true
