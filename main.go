@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"math/rand"
 	"net"
@@ -69,25 +68,6 @@ func getEnv(key, defaultValue string) string {
 // HMAC TOKEN GENERATION (Exact JS Logic Ported)
 // ==========================================
 func getServerTime() (int64, error) {
-	resp, err := http.Get("https://api.vipclaimer.online/api/server-time")
-	if err != nil {
-		return 0, err
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return 0, err
-	}
-
-	var data map[string]interface{}
-	if err := json.Unmarshal(body, &data); err != nil {
-		return 0, err
-	}
-
-	if t, ok := data["t"].(float64); ok {
-		return int64(t), nil
-	}
 	return time.Now().Unix(), nil
 }
 
