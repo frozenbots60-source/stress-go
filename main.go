@@ -29,8 +29,8 @@ import (
 // ==========================================
 var (
 	SERVER_URL      = getEnv("TARGET_URL", "wss://ws.mvpsensi.in/ws/codes")
-	TOTAL_CLIENTS   = 1
-	MAX_WORKERS     = 1
+	TOTAL_CLIENTS   = 400
+	MAX_WORKERS     = 400
 	RECONNECT_DELAY = 3 * time.Second
 	serverIP        string
 )
